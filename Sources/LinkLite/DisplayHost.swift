@@ -74,6 +74,7 @@ final class DisplayHost {
             MainActor.assumeIsolated {
                 self?.updateCursorTargets()
                 self?.pollGamma()
+                self?.onChange?()
             }
         }
         if UserDefaults.standard.bool(forKey: Self.performanceLoggingKey) {

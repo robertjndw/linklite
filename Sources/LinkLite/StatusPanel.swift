@@ -10,6 +10,8 @@ final class StatusPanelController {
     private let model: PanelModel
     private let panel: Panel
     private let hosting: NSHostingController<PanelView?>
+    /// Fresh for every presentation, so a reopen during the closing fade starts from scratch.
+    private var presentation = PanelPresentation()
     private weak var anchor: NSStatusBarButton?
     private var monitors: [Any] = []
     var onShow: (() -> Void)?
@@ -56,13 +58,15 @@ final class StatusPanelController {
         presentationID &+= 1
         anchor = button
         onShow?()
-        hosting.rootView = PanelView(model: model) { [weak self] size in
+        // The view springs itself in from .entering once it appears.
+        presentation = PanelPresentation()
+        hosting.rootView = PanelView(model: model, presentation: presentation) { [weak self] size in
             self?.place(size: size)
         }
         place(size: hosting.sizeThatFits(in: .zero))
         panel.alphaValue = 0
         panel.makeKeyAndOrderFront(nil)
-        // Reduce Motion: appear and disappear at once, like the disclosure inside.
+        // Reduce Motion: appear and disappear at once; the glass inside only fades.
         let reduceMotion = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
         NSAnimationContext.runAnimationGroup { context in
             context.duration = reduceMotion ? 0 : 0.16
@@ -90,6 +94,9 @@ final class StatusPanelController {
         monitors.forEach(NSEvent.removeMonitor)
         monitors = []
         anchor?.highlight(false)
+        // The glass fades and settles slightly inward while the window fades around it; both take
+        // the same 0.12 s, so the tree is released only after the glass is gone.
+        presentation.phase = .leaving
         NSAnimationContext.runAnimationGroup { context in
             context.duration = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion ? 0 : 0.12
             panel.animator().alphaValue = 0
@@ -119,13 +126,13 @@ final class StatusPanelController {
         }
         if panel.isVisible, frame.height < panel.frame.height,
            !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
-            // Clip the window only after the glass has finished collapsing inside it: a disclosure
-            // duration after the latest smaller size. Clipping late only leaves transparent space;
-            // clipping early would cut off glass that is still animating.
+            // Clip the window only after the glass has finished collapsing inside it: the layout
+            // spring's settle time after the latest smaller size. Clipping late only leaves
+            // transparent space; clipping early would cut off glass that is still animating.
             pendingShrink = frame
             resizeID &+= 1
             let pending = resizeID
-            DispatchQueue.main.asyncAfter(deadline: .now() + DisclosureMotion.duration) { [weak self] in
+            DispatchQueue.main.asyncAfter(deadline: .now() + PanelMotion.settleDuration) { [weak self] in
                 guard let self, self.isShown, self.resizeID == pending, let frame = self.pendingShrink else { return }
                 self.pendingShrink = nil
                 // A reversal toggled just now reports its new size only on SwiftUI's next pass;

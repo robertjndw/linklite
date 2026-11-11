@@ -12,19 +12,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let host = DisplayHost()
     private let updates = UpdateManager()
     private var statusItem: NSStatusItem?
+    private var icon: StatusItemIcon?
     private let model = PanelModel()
     private lazy var panel = StatusPanelController(model: model)
     private var workspaceObservers: [NSObjectProtocol] = []
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        if let image = NSImage(systemSymbolName: "display.2", accessibilityDescription: "LinkLite") {
-            image.isTemplate = true
-            item.button?.image = image
-        } else {
-            item.button?.title = "DL"
-        }
-        item.button?.toolTip = "LinkLite"
+        icon = StatusItemIcon(statusItem: item)
         item.button?.target = self
         item.button?.action = #selector(togglePanel)
         statusItem = item
@@ -33,6 +28,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         model.toggleAutomaticUpdates = { [weak self] in self?.toggleAutomaticUpdates() }
         model.checkForUpdates = { [weak self] in self?.checkForUpdates() }
         model.openScreenRecordingSettings = { [weak self] in self?.openScreenRecordingSettings() }
+        model.openDisplaysSettings = { [weak self] in self?.openDisplaysSettings() }
         model.quit = { [weak self] in self?.quit() }
         panel.onShow = { [weak self] in
             self?.host.refreshScreenRecordingAccess()
@@ -108,13 +104,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             .sorted { $0.monitor.head < $1.monitor.head }
             .map { head in
                 let monitor = head.monitor
+                let displayID = head.display?.displayID
                 return PanelModel.Monitor(
                     id: monitor.head,
                     name: monitor.name,
                     detail: "\(monitor.width) × \(monitor.height) · \(monitor.effectiveRefreshHz) Hz",
-                    problem: head.problem
+                    problem: head.problem,
+                    displayID: displayID,
+                    frame: displayID.map { CGDisplayBounds($0) }
                 )
             }
+        icon?.update(status: model.status, monitorCount: model.monitors.count,
+                     hasProblem: model.monitors.contains { $0.problem != nil })
         let login = SMAppService.mainApp.status
         model.openAtLogin = login == .enabled
         model.loginNeedsApproval = login == .requiresApproval
@@ -126,6 +127,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func openScreenRecordingSettings() {
         panel.hide()
         if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture") {
+            NSWorkspace.shared.open(url)
+        }
+    }
+
+    private func openDisplaysSettings() {
+        panel.hide()
+        if let url = URL(string: "x-apple.systempreferences:com.apple.Displays-Settings.extension") {
             NSWorkspace.shared.open(url)
         }
     }

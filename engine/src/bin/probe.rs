@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-//! Engage the dock's encrypted session and report what is plugged into each connector.
+//! Engage the dock's encrypted session and report what is plugged into each output, and which
+//! video head the dock gave it.
 //! Needs exclusive use of the dock: DisplayLink Manager must not be running.
 
 use dllite_engine::edid;
@@ -16,19 +17,20 @@ fn main() {
     };
     let profile = session.profile();
     println!(
-        "engaged {} ({} connectors, shared EDID handler: {}, reports presence: {})",
+        "engaged {} ({} outputs, {} heads, shared EDID handler: {}, reports presence: {})",
         profile.name(),
+        session.output_count(),
         session.connectors(),
         profile.shared_edid_handler(),
         profile.reports_presence()
     );
-    for head in 0..session.connectors() as u8 {
-        let present = session.probe_head_present(head);
-        print!("connector {head}: presence {present:?}; ");
-        match session.fetch_edid(head) {
-            Ok(bytes) => match edid::parse(&bytes) {
+    for output in 0..session.output_count() as u8 {
+        let present = session.probe_output_present(output);
+        print!("output {output}: presence {present:?}; ");
+        match session.fetch_edid(output) {
+            Ok((head, bytes)) => match edid::parse(&bytes) {
                 Ok(m) => println!(
-                    "{} {} ({}x{}@{}, {}x{} mm, {} EDID bytes)",
+                    "head {head}: {} {} ({}x{}@{}, {}x{} mm, {} EDID bytes)",
                     m.manufacturer,
                     m.name.as_deref().unwrap_or("unnamed"),
                     m.preferred.width,
@@ -38,7 +40,10 @@ fn main() {
                     m.height_mm,
                     bytes.len()
                 ),
-                Err(error) => println!("EDID unreadable ({error}, {} bytes)", bytes.len()),
+                Err(error) => println!(
+                    "head {head}: EDID unreadable ({error}, {} bytes)",
+                    bytes.len()
+                ),
             },
             Err(error) => println!("no EDID ({error})"),
         }

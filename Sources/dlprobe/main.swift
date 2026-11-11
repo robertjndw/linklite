@@ -149,7 +149,9 @@ do {
         if services.isEmpty { print("No matching DisplayLink USB devices found.") }
         for service in services {
             defer { IOObjectRelease(service) }
-            print(formatInterfaces(try parseConfigurationDescriptor(readConfigurationDescriptor(service: service))))
+            let config = try readConfigurationDescriptor(service: service)
+            print(parseDockIdentity(config)?.summary ?? "Identity: no identity descriptor; only product-ID quirks can place this dock")
+            print(formatInterfaces(try parseConfigurationDescriptor(config)))
         }
         exit(0)
     }

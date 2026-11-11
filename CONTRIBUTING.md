@@ -98,7 +98,7 @@ log stream --predicate 'subsystem == "com.ball.linklite"' --level info
 
 Use the **Dock compatibility report** issue template, whether your dock works or not. Include:
 
-- The dock's make and model, and the monitors attached to it (model, resolution, refresh rate).
+- The dock's make and model, and the monitors attached to it (model, the dock port each one uses, resolution, refresh rate).
 - Your macOS version and Mac model.
 - The output of the preflight probe, run from a clone of this repository:
 

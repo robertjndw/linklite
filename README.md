@@ -93,6 +93,7 @@ The tradeoff: DisplayLink Manager compresses video on the GPU; LinkLite compress
 |---|---|
 | Humanscale M/Connect 2 (DL-6xxx "Ridge") | Historically tested with two 4K60 monitors; v0.3.7+ hardware requalification pending |
 | Dell D6000 and other DL-6xxx docks | Same protocol family; not individually certified |
+| Targus DOCK310 (DL-6xxx "Ridge", USB `17e9:6024`) | HDMI output verified at 2560x1440@60 and 1920x1080@60; DisplayPort output untested |
 | DL-3xxx ("Ella") and DL-7400 ("Navarro") docks | Recognised by the protocol core; untested on macOS |
 | Macs | Apple silicon, macOS 14 or later; Intel not supported |
 | Protected (HDCP) video playback | Not supported |

@@ -217,6 +217,17 @@ python3 docs/benchmark/summarize-gpu.py docs/benchmark/gpu-baseline-2026-11-11.j
 - The stream report that is sealed with the session's key is not in the packed bytes (there is no session). The checksum covers the records only.
 - The CPU figure is whole-process, so it includes the worker pool's threads and anything else the process does during the frame.
 
+## GPU encoder on a dock, 2026-11-11
+
+One `BENCH_ONLY=lite` run with `GPUEncoder` off and one with it on, back to back on one boot. Apple M4 Pro, Targus DOCK310 (`17e9:6024`, Ridge firmware 12.2.25) with a Dell U2713H on its HDMI output at 2560x1440@60. The motion window was on the Dell. `PerformanceLogging` was on, so the engine figures are its own per-second counters averaged over the 45 s animation phase; CPU and memory come from `sampler.py`.
+
+| `GPUEncoder` | Frames in/s | MB/s to the dock | Engine encode, ms/present | Capture CPU, ms/frame | GPU, ms/frame | LinkLite CPU | Memory |
+|---|---|---|---|---|---|---|---|
+| off | 55.3 | 21.1 | 4.82 | 0.78 | 0 | 111% | 44 MB |
+| on | 54.5 | 19.9 | 0.43 | 0.23 | 1.85 | 12% | 121 MB |
+
+No dock resets or engine errors in either run. Only one monitor was attached, so `run.sh` logged that two external screens did not appear; that warning is expected here. This is a single run per setting, not the A/B/A comparison against DisplayLink Manager.
+
 ## README graphics
 
 The lead graphic uses the saved historical LinkLite 0.2.0 real-dock results in [`benchmark/results.json`](benchmark/results.json), not the v0.3.7 component checks. The memory headline compares each driver's mean memory across desktop and animation: `100 × (1 − 134.0549 / 512.8444) = 73.86%`, rounded to **74% less memory**. The supporting whole-GPU-busy figure under motion is `100 × (1 − 15.2308 / 32.9556) = 53.78%`, rounded to **54% lower**. Neither is a new measurement of v0.3.7.

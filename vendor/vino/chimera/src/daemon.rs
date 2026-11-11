@@ -58,12 +58,12 @@ fn run_session() -> Result<(), String> {
     // dock keeps the probe as the gate, and answers it without needing the engage first.
     let discover_by_edid = !session.profile().shared_edid_handler();
     let reports_presence = session.profile().reports_presence();
-    for head in 0..session.connectors() {
+    for output in 0..session.output_count() as u8 {
         if discover_by_edid
             || !reports_presence
-            || session.probe_head_present(head as u8)? == Some(true)
+            || session.probe_output_present(output)? == Some(true)
         {
-            connect_output(&mut session, &mut outputs[head], head as u8);
+            connect_output(&mut session, &mut outputs, output);
         }
     }
 
@@ -166,11 +166,20 @@ fn run_session() -> Result<(), String> {
     }
 }
 
-fn connect_output(session: &mut ControlSession, slot: &mut Option<Output>, head: u8) {
+/// Give physical output `output` a video head and a Revdi card. `outputs` is indexed by head.
+fn connect_output(
+    session: &mut ControlSession,
+    outputs: &mut [Option<Output>; MAX_CONNECTORS],
+    output: u8,
+) {
+    let (head, edid) = match session.fetch_edid(output) {
+        Ok(found) => found,
+        Err(error) => {
+            eprintln!("output {output}: fetch EDID: {error}");
+            return;
+        }
+    };
     let result = (|| -> Result<Output, String> {
-        let edid = session
-            .fetch_edid(head)
-            .map_err(|error| format!("fetch EDID: {error}"))?;
         // A card of this output's own, and the same one again after a reconnect: several outputs
         // are driven at once, and `open` hands the same card to every caller.
         let mut card = RevdiCard::open_nth(usize::from(head))
@@ -195,11 +204,14 @@ fn connect_output(session: &mut ControlSession, slot: &mut Option<Output>, head:
         })
     })();
     match result {
-        Ok(output) => {
-            println!("head {head}: monitor connected; waiting for a compositor mode");
-            *slot = Some(output);
+        Ok(connected) => {
+            println!("head {head}: monitor on output {output} connected; waiting for a compositor mode");
+            outputs[usize::from(head)] = Some(connected);
         }
-        Err(error) => eprintln!("head {head}: {error}"),
+        Err(error) => {
+            session.release_head(head);
+            eprintln!("head {head}: {error}");
+        }
     }
 }
 
@@ -213,18 +225,22 @@ fn refresh_topology(
     if !session.profile().reports_presence() {
         return Ok(());
     }
-    for (head, slot) in outputs.iter_mut().enumerate() {
-        // A deliberate DPMS-off closes the downstream stream and can look like removal.
-        if slot
-            .as_ref()
-            .is_some_and(|output| output.mode.is_some() && !output.active)
+    for socket in 0..session.output_count() as u8 {
+        let head = session.output_head(socket).map(usize::from);
+        // A deliberate DPMS-off closes the downstream stream and can look like removal. An output
+        // without a head is not worth a probe while no head could be given to it.
+        if head.is_some_and(|head| {
+            outputs[head]
+                .as_ref()
+                .is_some_and(|output| output.mode.is_some() && !output.active)
+        }) || (head.is_none() && !session.has_free_head())
         {
             continue;
         }
-        let present = session.probe_head_present(head as u8)?;
-        let Some(output) = slot.as_mut() else {
+        let present = session.probe_output_present(socket)?;
+        let Some((head, output)) = head.and_then(|head| Some((head, outputs[head].as_mut()?))) else {
             if present == Some(true) {
-                connect_output(session, slot, head as u8);
+                connect_output(session, outputs, socket);
             }
             continue;
         };
@@ -248,7 +264,8 @@ fn refresh_topology(
         output.presence_debounce = output.presence_debounce.saturating_add(1);
         if output.presence_debounce >= 2 {
             println!("head {head}: monitor disconnected");
-            *slot = None;
+            outputs[head] = None;
+            session.release_head(head as u8);
         }
     }
     Ok(())

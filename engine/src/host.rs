@@ -1009,14 +1009,17 @@ fn run_session(
     events.state(State::Engaged, "Dock connected. Looking for monitors…");
 
     // Discovery as the chimera daemon does it: a dock with one EDID handler shared between its
-    // heads answers a blind fetch on an empty socket with the other head's monitor, so there the
-    // presence probe gates the fetch.
+    // outputs answers a blind fetch on an empty socket with another output's monitor, so there the
+    // presence probe gates the fetch. Discovery walks outputs and everything after `attach` is
+    // indexed by head. Once every head is taken an output is not probed at all (Ridge has more
+    // outputs than heads).
     let discover_by_edid = !profile.shared_edid_handler();
     let reports_presence = profile.reports_presence();
     let mut found = 0;
-    for head in 0..session.connectors() as u8 {
-        if (discover_by_edid || !reports_presence || session.probe_head_present(head)? == Some(true))
-            && attach(shared, events, &mut session, outputs, head, Discovery::Gated)?
+    for output in 0..session.output_count() as u8 {
+        if session.has_free_head()
+            && (discover_by_edid || !reports_presence || session.probe_output_present(output)? == Some(true))
+            && attach(shared, events, &mut session, outputs, output, Discovery::Gated)?
         {
             found += 1;
         }
@@ -1025,8 +1028,8 @@ fn run_session(
     // engaged for it (docs/ridge.md in the Vino tree). With nothing found, read each socket once,
     // keeping an EDID only if that socket then probes present.
     if found == 0 && !discover_by_edid && reports_presence {
-        for head in 0..session.connectors() as u8 {
-            if attach(shared, events, &mut session, outputs, head, Discovery::Blind)? {
+        for output in 0..session.output_count() as u8 {
+            if attach(shared, events, &mut session, outputs, output, Discovery::Blind)? {
                 found += 1;
             }
         }
@@ -1191,10 +1194,13 @@ fn run_session(
             next_presence = Instant::now() + PRESENCE_PERIOD;
         } else if reports_presence && now >= next_empty_scan {
             // Measured on the M/Connect 2: a monitor switched on beside a lit one is not announced,
-            // so empty sockets are probed slowly. Lit sockets are never probed here.
-            for head in 0..session.connectors() {
-                if outputs[head].is_none() && session.probe_head_present(head as u8)? == Some(true) {
-                    attach(shared, events, &mut session, outputs, head as u8, Discovery::Gated)?;
+            // so empty sockets are probed slowly. Sockets holding a head are never probed here.
+            for output in 0..session.output_count() as u8 {
+                if session.output_head(output).is_none()
+                    && session.has_free_head()
+                    && session.probe_output_present(output)? == Some(true)
+                {
+                    attach(shared, events, &mut session, outputs, output, Discovery::Gated)?;
                     report_monitors(events, outputs.iter().flatten().count());
                 }
             }
@@ -1252,22 +1258,22 @@ enum Discovery {
 
 fn report_monitors(events: &impl Events, count: usize) {
     let message = match count {
-        0 => "Dock connected. No monitors detected on its DisplayPort outputs.".to_string(),
+        0 => "Dock connected. No monitors detected on its outputs.".to_string(),
         1 => "Dock connected: 1 monitor".to_string(),
         n => format!("Dock connected: {n} monitors"),
     };
     events.state(State::Engaged, &message);
 }
 
-/// Fetch a head's EDID, program its preferred mode, and tell the host it is ready.
-/// Returns whether the head was lit. A monitor that cannot be read or programmed is reported and
-/// skipped, not fatal.
+/// Give a physical output a video head, fetch its EDID, program its preferred mode, and tell the
+/// host it is ready. Returns whether it was lit. A monitor that cannot be read or programmed is
+/// reported and skipped, not fatal, and the head it was given is freed again.
 fn attach(
     shared: &Shared,
     events: &impl Events,
     session: &mut ControlSession,
     outputs: &mut [Option<Output>; MAX_CONNECTORS],
-    head: u8,
+    output: u8,
     discovery: Discovery,
 ) -> Result<bool, String> {
     let report = |message: String| {
@@ -1275,24 +1281,26 @@ fn attach(
             events.state(State::Engaged, &message);
         }
     };
-    let edid_bytes = match session.fetch_edid(head) {
-        Ok(bytes) => bytes,
+    let (head, edid_bytes) = match session.fetch_edid(output) {
+        Ok(found) => found,
         Err(error) => {
-            report(format!("Connector {}: cannot read the monitor ({error})", head + 1));
+            report(format!("Connector {}: cannot read the monitor ({error})", output + 1));
             return Ok(false);
         }
     };
-    // The dock's shared EDID handler can answer for the other socket's monitor.
-    if outputs.iter().flatten().any(|output| output.edid == edid_bytes) {
-        return Ok(false);
-    }
-    if discovery == Discovery::Blind && session.probe_head_present(head)? != Some(true) {
+    // From here the output holds `head`, which a monitor that is not lit must give back. The
+    // dock's shared EDID handler can answer for another socket's monitor.
+    if outputs.iter().flatten().any(|lit| lit.edid == edid_bytes)
+        || (discovery == Discovery::Blind && session.probe_output_present(output)? != Some(true))
+    {
+        session.release_head(head);
         return Ok(false);
     }
     let monitor = match edid::parse(&edid_bytes) {
         Ok(monitor) => monitor,
         Err(error) => {
-            report(format!("Connector {}: unusable EDID ({error})", head + 1));
+            session.release_head(head);
+            report(format!("Connector {}: unusable EDID ({error})", output + 1));
             return Ok(false);
         }
     };
@@ -1423,6 +1431,7 @@ fn set_power(session: &mut ControlSession, output: &mut Output, head: u8, on: bo
     Ok(())
 }
 
+/// Probe every physical output: light a monitor that appeared, and drop the head of one that left.
 fn refresh_topology(
     shared: &Shared,
     events: &impl Events,
@@ -1430,15 +1439,19 @@ fn refresh_topology(
     outputs: &mut [Option<Output>; MAX_CONNECTORS],
 ) -> Result<(), String> {
     let before = outputs.iter().flatten().count();
-    for head in 0..session.connectors() {
+    for socket in 0..session.output_count() as u8 {
+        let head = session.output_head(socket).map(usize::from);
         // A deliberately powered-down head can look removed; leave it alone until it is woken.
-        if outputs[head].as_ref().is_some_and(|output| !output.lit) {
+        // An output without a head is not worth a probe while no head could be given to it.
+        if head.is_some_and(|head| outputs[head].as_ref().is_some_and(|output| !output.lit))
+            || (head.is_none() && !session.has_free_head())
+        {
             continue;
         }
-        let present = session.probe_head_present(head as u8)?;
-        let Some(output) = outputs[head].as_mut() else {
+        let present = session.probe_output_present(socket)?;
+        let Some((head, output)) = head.and_then(|head| Some((head, outputs[head].as_mut()?))) else {
             if present == Some(true) {
-                attach(shared, events, session, outputs, head as u8, Discovery::Gated)?;
+                attach(shared, events, session, outputs, socket, Discovery::Gated)?;
             }
             continue;
         };
@@ -1462,6 +1475,7 @@ fn refresh_topology(
         output.presence_debounce = output.presence_debounce.saturating_add(1);
         if output.presence_debounce >= 2 {
             outputs[head] = None;
+            session.release_head(head as u8);
             shared.close(head);
             events.detached(head as u8);
         }

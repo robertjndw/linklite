@@ -86,6 +86,48 @@ pub fn open_in(ks: &[u8; 16], riv: &[u8; 8], seq: u32, body: &[u8]) -> Result<Ve
     Ok(cp::open_in(ks, riv, seq, body)?.into_vec())
 }
 
+/// Decrypt a dock-to-host `wsub=0x45` frame without caring what it says, for diagnostics.
+///
+/// Tries the same four riv candidates, in the same order, as `cp::decode_in_lenient`, and names the
+/// one that authenticated.
+pub fn open_reply(ks: &[u8; 16], out_riv: &[u8; 8], wire: &[u8]) -> Option<(&'static str, Vec<u8>)> {
+    if wire.len() <= 16 || u16::from_le_bytes([wire[8], wire[9]]) != 0x45 {
+        return None;
+    }
+    let seq = u32::from_le_bytes([wire[12], wire[13], wire[14], wire[15]]);
+    let mut in_head1 = cp::in_riv(out_riv);
+    in_head1[0] ^= 0x80;
+    let mut out_head1 = *out_riv;
+    out_head1[0] ^= 0x80;
+    let candidates = [
+        ("in/h0", cp::in_riv(out_riv)),
+        ("in/h1", in_head1),
+        ("out/h0", *out_riv),
+        ("out/h1", out_head1),
+    ];
+    candidates.into_iter().find_map(|(tag, riv)| {
+        cp::open_in(ks, &riv, seq, &wire[16..])
+            .ok()
+            .map(|plaintext| (tag, plaintext.into_vec()))
+    })
+}
+
+/// The `sub`, echoed counter and status of a dock reply: `(sub, counter, status)`.
+///
+/// The status is the little-endian word at inner offset 20. DisplayLink Manager treats 0 as
+/// success, tolerates `0x0b`, and reports anything else as "Device returned error" (local
+/// displaylink-lite patch 17, from its message handling).
+pub fn reply_status(ks: &[u8; 16], out_riv: &[u8; 8], wire: &[u8]) -> Option<(u16, u16, u16)> {
+    let (_, pt) = open_reply(ks, out_riv, wire)?;
+    let word = |at: usize| u16::from_le_bytes([pt[at], pt[at + 1]]);
+    (pt.len() >= 22).then(|| (word(2), word(4), word(20)))
+}
+
+/// Whether a reply status means the dock did what it was asked; see [`reply_status`].
+pub fn reply_status_ok(status: u16) -> bool {
+    matches!(status, 0 | 0x0b)
+}
+
 /// `cp::in_riv` — derive the dock→host riv from the host→dock riv (identity).
 pub fn in_riv(out_riv: &[u8; 8]) -> [u8; 8] {
     cp::in_riv(out_riv)
@@ -151,6 +193,14 @@ pub fn edid_engage_req(counter: u16, head: u8) -> Result<Vec<u8>> {
     Ok(cp::edid_engage_req(counter, head)?.into_vec())
 }
 
+/// OUT `id=0x16 sub=0x0023` (`cp::edid_sink_state`) assigns `output` (byte 22) to video head
+/// `head` (byte 23); `0xff` there unassigns it. [`edid_engage_req`] is the `output == head` case,
+/// which is all a dock whose outputs and heads coincide ever sends.
+/// Local displaylink-lite patch 17.
+pub fn assign_head_req(counter: u16, output: u8, head: u8) -> Result<Vec<u8>> {
+    Ok(cp::edid_sink_state(counter, output, head)?.into_vec())
+}
+
 pub fn edid_readiness_kick(counter: u16, head: u8) -> Result<Vec<u8>> {
     Ok(cp::edid_readiness_kick(counter, head)?.into_vec())
 }
@@ -183,6 +233,22 @@ pub fn probe_reply_status(
     wire: &[u8],
 ) -> Option<(u16, u32, bool)> {
     cp::probe_reply_status(ks, out_riv, wire)
+}
+
+/// Whether a presence probe's status word (inner bytes 22 to 25, little-endian) reports a sink.
+///
+/// Upstream reads only bit `0x1000` (byte 23 bit 4). That is how the M/Connect 2 reports its
+/// DisplayPort monitors (`05 11 27 00`), but a Targus DOCK310 never sets it for the HDMI monitor
+/// on its output 2 (`04 01 27 00`). Byte 24 tells them apart on both docks: `0x27` with a sink,
+/// and `0x20`, `0x21`, `0x60` or `0x61` on an empty output (`03 01 20 00` and `05 01 60 00` on the
+/// DOCK310, all four on the M/Connect 2). Only bits 1 and 2 of that byte separate the two groups,
+/// so a sink needs both; that adds nothing for any word the M/Connect 2 has reported empty.
+/// Byte 22 looks like the output type (4 for HDMI) and is not used. Local displaylink-lite
+/// patch 17.
+pub fn probe_reports_sink(status: u32) -> bool {
+    const SINK_BITS: u8 = 0x06;
+    let byte24 = status.to_le_bytes()[2];
+    status & 0x1000 != 0 || byte24 & SINK_BITS == SINK_BITS
 }
 
 /// `cp::cursor_create` inner plaintext.
@@ -381,10 +447,17 @@ impl DockProfile {
         self.profile.name
     }
 
-    /// Number of downstream connectors the dock answers a presence probe for. This is not the
-    /// video-endpoint count: the DL7400 has four connectors feeding two endpoints.
+    /// Number of video heads the dock drives. This is not the video-endpoint count: the DL7400
+    /// has four heads feeding two endpoints.
     pub fn connectors(&self) -> u8 {
         self.profile.topology.connectors
+    }
+
+    /// Number of physical outputs, the range the presence probe and the EDID requests select
+    /// from. It can exceed [`Self::connectors`]: Ridge firmware has three outputs for two heads,
+    /// and each output in use is assigned a head (local displaylink-lite patch 17).
+    pub fn outputs(&self) -> u8 {
+        self.profile.topology.outputs
     }
 
     /// Video bulk-OUT endpoint per connector, repeats included.
@@ -2077,6 +2150,48 @@ mod production_builders {
                 check(coder, &want)?;
             }
         }
+        Ok(())
+    }
+
+    /// Every status word measured on hardware, read with the rule in [`probe_reports_sink`].
+    #[test]
+    fn presence_follows_the_measured_status_words() {
+        let word = |bytes: [u8; 4]| u32::from_le_bytes(bytes);
+        // M/Connect 2, DisplayPort monitor on output 0 or 1.
+        assert!(probe_reports_sink(word([0x05, 0x11, 0x27, 0x00])));
+        // Targus DOCK310, HDMI monitor on output 2: bit 0x1000 clear.
+        assert!(probe_reports_sink(word([0x04, 0x01, 0x27, 0x00])));
+        // Empty outputs on both docks.
+        for byte24 in [0x20, 0x21, 0x60, 0x61] {
+            assert!(!probe_reports_sink(word([0x05, 0x01, byte24, 0x00])));
+        }
+        assert!(!probe_reports_sink(word([0x03, 0x01, 0x20, 0x00])));
+        assert!(!probe_reports_sink(0));
+    }
+
+    #[test]
+    fn ridge_has_more_outputs_than_heads() {
+        let ridge = ridge();
+        assert_eq!((ridge.connectors(), ridge.outputs()), (2, 3));
+        for family in [Family::Ella, Family::Navarro] {
+            let dock = DockProfile::for_family(family).unwrap();
+            assert_eq!(dock.outputs(), dock.connectors());
+        }
+    }
+
+    #[test]
+    fn assigning_an_output_to_its_own_head_is_the_upstream_engage() -> Result {
+        for connector in 0..4u8 {
+            assert_eq!(
+                assign_head_req(7, connector, connector)?[..24],
+                edid_engage_req(7, connector)?[..24]
+            );
+        }
+        let assign = assign_head_req(7, 2, 1)?;
+        assert_eq!(assign[..4], [0x16, 0x00, 0x23, 0x00]);
+        assert_eq!(assign[22..24], [2, 1]);
+        assert!(reply_status_ok(0) && reply_status_ok(0x0b));
+        assert!(!reply_status_ok(3) && !reply_status_ok(0x0d));
         Ok(())
     }
 }

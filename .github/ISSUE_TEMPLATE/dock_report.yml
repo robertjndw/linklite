@@ -35,9 +35,9 @@ body:
     id: monitors
     attributes:
       label: Monitors
-      description: Each monitor on the dock, with the resolution and refresh rate you used.
+      description: Each monitor on the dock, the port it is plugged into (HDMI, DisplayPort, USB-C), and the resolution and refresh rate you used.
       placeholder: |
-        2x HP Z27k G3, 3840x2160 @ 60 Hz
+        2x HP Z27k G3 on DisplayPort, 3840x2160 @ 60 Hz
     validations:
       required: true
   - type: input

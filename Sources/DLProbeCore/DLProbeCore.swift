@@ -195,6 +195,62 @@ public func parseConfigurationDescriptor(_ bytes: [UInt8]) throws -> [InterfaceL
     return interfaces
 }
 
+/// The dock's own statement of what it is: a 16-byte vendor descriptor (type 0x40) inside the
+/// configuration descriptor, `[len, 0x40, major, minor, patch, ..., name(8)]`. The engine places a
+/// dock by this name, not by product ID, so it is what decides whether a dock is supported.
+public struct DockIdentity: Equatable {
+    public var firmware: (major: Int, minor: Int, patch: Int)
+    public var platform: String
+
+    public init(firmware: (major: Int, minor: Int, patch: Int), platform: String) {
+        self.firmware = firmware
+        self.platform = platform
+    }
+
+    public static func == (a: DockIdentity, b: DockIdentity) -> Bool {
+        a.firmware == b.firmware && a.platform == b.platform
+    }
+
+    /// Mirrors `Family::from_identity` and `profile::for_family` in vendor/vino, which stay the
+    /// source of truth; dlprobe deliberately does not link the engine, so the names are restated.
+    public var family: (name: String, supported: Bool)? {
+        switch platform {
+        case "NavaDock": ("Navarro (DL-7400)", true)
+        case "Ridge", "RidgeDoc": ("Ridge (DL-6xxx)", true)
+        case "Ella", "EllaDock": ("Ella (DL-3x00)", true)
+        case "Firefly", "FflyMoni": ("Firefly monitor", false)
+        default: nil
+        }
+    }
+
+    public var summary: String {
+        let version = "\(firmware.major).\(firmware.minor).\(firmware.patch)"
+        guard let family else {
+            return "Identity: \"\(platform)\" firmware \(version) - unrecognised family, not supported"
+        }
+        let verdict = family.supported ? "supported" : "not supported"
+        return "Identity: \"\(platform)\" firmware \(version) - \(family.name), \(verdict)"
+    }
+}
+
+/// The identity descriptor from a full configuration descriptor, or nil when the dock has none.
+public func parseDockIdentity(_ bytes: [UInt8]) -> DockIdentity? {
+    var offset = 0
+    while offset + 2 <= bytes.count {
+        let length = Int(bytes[offset])
+        guard length >= 2, offset + length <= bytes.count else { return nil }
+        if bytes[offset + 1] == 0x40, length >= 16 {
+            let d = Array(bytes[offset..<(offset + 16)])
+            // The name is padded with NULs or spaces, matching `Identity::platform` in vino-driver.
+            let name = d[8..<16].prefix { $0 != 0 && $0 != 0x20 }
+            let platform = String(decoding: name, as: UTF8.self)
+            return DockIdentity(firmware: (Int(d[2]), Int(d[3]), Int(d[4])), platform: platform)
+        }
+        offset += length
+    }
+    return nil
+}
+
 public func formatInterfaces(_ interfaces: [InterfaceLayout]) -> String {
     interfaces.map { interface in
         let header = "Interface \(interface.number) alt \(interface.alternateSetting): class \(hex2(interface.interfaceClass))/\(hex2(interface.subclass))/\(hex2(interface.interfaceProtocol)) - \(interface.role)"

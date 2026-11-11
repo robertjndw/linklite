@@ -7,6 +7,7 @@
 
 use crate::kvino;
 use crate::kvino::DockProfile;
+use crate::trace::{self, trace};
 use crate::MAX_CONNECTORS;
 use std::time::{Duration, Instant};
 use vino_driver::{Dock, Error as UsbError};
@@ -143,6 +144,14 @@ pub struct ControlSession {
     downstream_changed: bool,
     /// See [`ControlSession::last_present`].
     last_present: PresentTiming,
+    /// Set around the steady-state keepalive so `DLL_TRACE` shows its replies only when they
+    /// change; the same poll during a mode set is traced every time.
+    trace_steady_poll: bool,
+    /// The output each video head is assigned to, set by [`ControlSession::fetch_edid`].
+    ///
+    /// Everything about video (mode set, markers, authentication, records, cursor) addresses the
+    /// head; only presence and EDID address the output. Local displaylink-lite patch 17.
+    head_output: [Option<u8>; MAX_CONNECTORS],
 }
 
 impl ControlSession {
@@ -198,13 +207,44 @@ impl ControlSession {
             cursor_shot: core::array::from_fn(|_| None),
             downstream_changed: false,
             last_present: PresentTiming::default(),
+            trace_steady_poll: false,
+            head_output: [None; MAX_CONNECTORS],
         })
     }
 
-    /// How many connectors this dock actually backs. Every per-head loop is bounded by this,
+    /// How many video heads this dock actually backs. Every per-head loop is bounded by this,
     /// never by [`MAX_CONNECTORS`], which is only an array size.
     pub fn connectors(&self) -> usize {
         self.dock.connectors()
+    }
+
+    /// How many physical outputs the dock has, which can exceed [`Self::connectors`]. Presence
+    /// and EDID loops are bounded by this.
+    pub fn output_count(&self) -> usize {
+        usize::from(self.profile.outputs())
+    }
+
+    /// The output `head` is assigned to, if any.
+    pub fn head_output(&self, head: u8) -> Option<u8> {
+        self.head_output.get(usize::from(head)).copied().flatten()
+    }
+
+    /// The head `output` is assigned to, if any.
+    pub fn output_head(&self, output: u8) -> Option<u8> {
+        (0..self.connectors() as u8).find(|&head| self.head_output(head) == Some(output))
+    }
+
+    /// Whether some video head is not assigned to an output, so another monitor could be lit.
+    pub fn has_free_head(&self) -> bool {
+        (0..self.connectors() as u8).any(|head| self.head_output(head).is_none())
+    }
+
+    /// Forget `head`'s assignment so another output can be given it. Nothing is sent: the next
+    /// engage for the head reassigns it on the dock.
+    pub fn release_head(&mut self, head: u8) {
+        if let Some(slot) = self.head_output.get_mut(usize::from(head)) {
+            *slot = None;
+        }
     }
 
     /// This dock's profile, chosen from its identity descriptor.
@@ -212,38 +252,67 @@ impl ControlSession {
         self.profile
     }
 
-    /// Fetch one downstream head's EDID without losing the session counters.
-    pub fn fetch_edid(&mut self, head: u8) -> Result<Vec<u8>, crate::edid_fetch::FetchError> {
-        crate::edid_fetch::fetch_edid(
+    /// Assign `output` to a video head and fetch its EDID, without losing the session counters.
+    /// Returns the head, which is what every video call for this monitor then takes; the
+    /// assignment holds until [`Self::release_head`].
+    ///
+    /// The output keeps a head it already holds. Otherwise its own number is offered first when
+    /// that head exists and is free, then the other free heads from the lowest: a dock whose
+    /// outputs and heads coincide is driven exactly as before, and an output with no head of its
+    /// own number (Ridge's output 2) takes the lowest free head the dock accepts.
+    pub fn fetch_edid(&mut self, output: u8) -> Result<(u8, Vec<u8>), crate::edid_fetch::FetchError> {
+        let held = self.output_head(output);
+        let free = |head: u8| self.head_output(head).is_none();
+        let heads: Vec<u8> = held
+            .into_iter()
+            .chain((usize::from(output) < self.connectors() && free(output)).then_some(output))
+            .chain((0..self.connectors() as u8).filter(|&head| free(head) && head != output))
+            .collect();
+        let (head, edid) = crate::edid_fetch::fetch_edid(
             &self.dock,
             self.profile,
             &self.keys.control_key,
             &self.keys.control_nonce,
             &mut self.wire_seq,
             &mut self.inner_counter,
-            head,
-        )
+            output,
+            &heads,
+        )?;
+        if let Some(previous) = held.filter(|&previous| previous != head) {
+            self.release_head(previous);
+        }
+        self.head_output[usize::from(head)] = Some(output);
+        Ok((head, edid))
     }
 
-    /// Probe whether a monitor is attached to one downstream head.
+    /// Probe whether a monitor is attached to one physical output.
     ///
-    /// Presence is bit `0x1000` of the reply's status word (inner byte 23 bit 4): `05 11 27 00` for
-    /// an occupied connector, `05 01 <20|21|60|61> 00` for an empty one. **Which handler answered
-    /// says nothing about it** -- the dock replies `id=0x44` either way, and reading presence from
-    /// the id reports every head as connected.
-    pub fn probe_head_present(&mut self, head: u8) -> Result<Option<bool>, String> {
+    /// Presence comes from the reply's status word ([`kvino::probe_reports_sink`]), not from which
+    /// handler answered: the dock replies `id=0x44` either way, so going by the id reports every
+    /// output as connected.
+    pub fn probe_output_present(&mut self, output: u8) -> Result<Option<bool>, String> {
         let request_counter = self.inner_counter;
-        let message = kvino::get_edid_req_sub(self.inner_counter, 0x20, head)
+        let message = kvino::get_edid_req_sub(self.inner_counter, 0x20, output)
             .map_err(build_error("monitor presence probe"))?;
         let Some(reply) = self.send_control_echoing(0x15, &message, request_counter)? else {
+            trace!("presence output {output}: no reply echoed counter {request_counter:#06x}");
             return Ok(None);
         };
-        let Some((_, status, _)) =
+        let Some((id, status, ready)) =
             kvino::probe_reply_status(&self.keys.control_key, &self.keys.control_nonce, &reply)
         else {
+            trace!(
+                "presence output {output}: reply is not a probe answer: {}",
+                trace::describe(&self.keys.control_key, &self.keys.control_nonce, &reply)
+            );
             return Ok(None);
         };
-        Ok(Some(status & 0x0000_1000 != 0))
+        let present = kvino::probe_reports_sink(status);
+        trace!(
+            "presence output {output}: id={id:#06x} status_word={status:#010x} sink={present} \
+             ready={ready}"
+        );
+        Ok(Some(present))
     }
 
     /// Send the steady-state heartbeat and reap its paired reply.
@@ -255,7 +324,10 @@ impl ControlSession {
 
     /// Send the high-cadence device-status poll that keeps the control session live.
     pub fn keepalive_poll(&mut self) -> Result<(), String> {
-        self.poll_status()
+        self.trace_steady_poll = true;
+        let result = self.poll_status();
+        self.trace_steady_poll = false;
+        result
     }
 
     /// Whether the dock has announced a downstream change (monitor plugged, unplugged, or powered)
@@ -425,6 +497,7 @@ impl ControlSession {
                 .enumerate()
                 .any(|(other, active)| *active && other != usize::from(head))
         {
+            trace!("activate_mode head={head}: declined, another connector is already lit");
             return Ok(false);
         }
         self.program_mode(head, width, height, refresh_hz)
@@ -472,6 +545,11 @@ impl ControlSession {
         )
         .map_err(build_error("mode profile"))?;
 
+        trace!(
+            "set-mode head={head} {width}x{height}@{refresh_hz} profile={} set-mode plaintext={}",
+            self.profile.name(),
+            trace::hex(&mode)
+        );
         // The bracket the timing is programmed inside. A connector arriving from a blank needs it
         // exactly as much as one being configured cold, because it is the sink that has to be
         // retrained onto the new timing.
@@ -521,6 +599,10 @@ impl ControlSession {
         // If anything stalled badly enough that the bracket is no longer being paced, abandon and
         // let the caller retry rather than sending a compressed sequence the dock will reject.
         let late = anchor.elapsed();
+        trace!(
+            "set-mode head={head} bracket finished {} ms after the anchor",
+            late.as_millis()
+        );
         if late > Duration::from_millis(300) {
             return Err(format!(
                 "activation bracket overran ({} ms before first video); retrying",
@@ -901,8 +983,45 @@ impl ControlSession {
         self.wire_seq = self
             .wire_seq
             .wrapping_add(content.len().div_ceil(16) as u32);
+        let request_counter = self.inner_counter;
         self.inner_counter = self.inner_counter.wrapping_add(1);
-        self.receive(REPLY_TIMEOUT)
+        let reply = self.receive(REPLY_TIMEOUT)?;
+        self.trace_exchange(id, content, request_counter, reply.as_deref());
+        Ok(reply)
+    }
+
+    /// `DLL_TRACE` view of one request and the next frame the dock sent back.
+    ///
+    /// Only mode-set, marker, presence and status traffic is shown; per-frame cursor and heartbeat
+    /// records would drown it. The reply is whatever arrived next and can answer an earlier
+    /// request (see [`ControlSession::send_control_echoing`]), so its counter is compared.
+    fn trace_exchange(&self, id: u16, content: &[u8], counter: u16, reply: Option<&[u8]>) {
+        let sub = content.get(2..4).map_or(0, |s| u16::from_le_bytes([s[0], s[1]]));
+        if !trace::enabled() || !matches!(id, 0x14 | 0x15 | 0x16 | 0x48) || (id == 0x16 && sub == 0x75)
+        {
+            return;
+        }
+        let (ks, riv) = (&self.keys.control_key, &self.keys.control_nonce);
+        if id == 0x14 && self.trace_steady_poll {
+            if let Some(reply) = reply {
+                trace::reply_deduped("keepalive status reply", ks, riv, reply);
+            }
+            return;
+        }
+        let selector = match (id, content.get(22), content.get(23)) {
+            (0x16, Some(connector), Some(state)) if matches!(sub, 0x2e | 0x2f) => {
+                format!(" connector={connector} state={state}")
+            }
+            _ => String::new(),
+        };
+        let request = format!("req id={id:#06x} sub={sub:#06x} ctr={counter:#06x}{selector}");
+        match reply {
+            Some(reply) => trace!(
+                "{request} -> {}",
+                trace::describe(ks, riv, reply)
+            ),
+            None => trace!("{request} -> no reply within {REPLY_TIMEOUT:?}"),
+        }
     }
 
     /// Send a control message and return the reply that answers *this* one.
@@ -939,6 +1058,12 @@ impl ControlSession {
             }
             // An empty read is not the end of the answer: keep draining until the deadline.
             reply = self.receive(REPLY_TIMEOUT)?;
+            if let Some(frame) = reply.as_deref() {
+                trace!(
+                    "drain while waiting for ctr {request_counter:#06x}: {}",
+                    trace::describe(&self.keys.control_key, &self.keys.control_nonce, frame)
+                );
+            }
         }
     }
 
@@ -950,6 +1075,10 @@ impl ControlSession {
                 .is_some_and(|(id, sub, _)| id == 0x03 && sub == 0x82)
             {
                 self.downstream_changed = true;
+                trace!(
+                    "downstream-change push (id=0x03 sub=0x82): {}",
+                    trace::describe(&self.keys.control_key, &self.keys.control_nonce, frame)
+                );
             }
         }
         Ok(frame)
@@ -1069,6 +1198,10 @@ fn authenticate(dock: &Dock) -> Result<SessionKeys, String> {
         ));
     }
     let repeater = certificate_message[0] != 0;
+    trace!(
+        "AKE dock-wide: AKE_Send_Cert received, repeater flag={repeater}, {} bytes",
+        certificate_message.len()
+    );
     let certificate = &certificate_message[1..];
     let mut modulus = [0; 128];
     modulus.copy_from_slice(&certificate[5..133]);
@@ -1080,7 +1213,12 @@ fn authenticate(dock: &Dock) -> Result<SessionKeys, String> {
         &kvino::ake_transmitter_info(sequence, 0).map_err(build_error("AKE_Transmitter_Info"))?,
     )?;
     sequence += 1;
-    let _ = receive_hdcp(dock)?;
+    let (receiver_info_id, receiver_info) = receive_hdcp(dock)?;
+    trace!(
+        "AKE dock-wide: {} ({receiver_info_id:#04x}) payload={}",
+        trace::hdcp_name(receiver_info_id),
+        trace::hex(&receiver_info)
+    );
 
     let mut km = [0; 16];
     kvino::rng::fill(&mut km);
@@ -1095,6 +1233,11 @@ fn authenticate(dock: &Dock) -> Result<SessionKeys, String> {
     sequence += 1;
 
     let (message_id, receiver_random) = receive_hdcp(dock)?;
+    trace!(
+        "AKE dock-wide: {} ({message_id:#04x}) payload={}",
+        trace::hdcp_name(message_id),
+        trace::hex(&receiver_random)
+    );
     if message_id != id::AKE_SEND_RRX || receiver_random.len() < 8 {
         return Err(format!("invalid AKE_Send_Rrx message {message_id:#04x}"));
     }
@@ -1109,7 +1252,12 @@ fn authenticate(dock: &Dock) -> Result<SessionKeys, String> {
     {
         return Err("receiver H' verification failed".into());
     }
-    let _ = receive_hdcp(dock)?;
+    let (extra_id, extra) = receive_hdcp(dock)?;
+    trace!(
+        "AKE dock-wide: after H': {} ({extra_id:#04x}) payload={}",
+        trace::hdcp_name(extra_id),
+        trace::hex(&extra)
+    );
 
     let mut rn = [0; 8];
     kvino::rng::fill(&mut rn);
@@ -1148,6 +1296,11 @@ fn authenticate(dock: &Dock) -> Result<SessionKeys, String> {
             ));
         }
         let split = list.len() - 16;
+        trace!(
+            "AKE dock-wide: ReceiverID_List {} bytes (V' is the last 16): {}",
+            list.len(),
+            trace::receiver_list(&list[..split])
+        );
         let v = kvino::compute_v_full(&kd, &list[..split]);
         if v[..16] != list[split..] {
             return Err("receiver V' verification failed".into());
@@ -1381,6 +1534,9 @@ fn configure_head(
     let mut receiver_random = None;
     let mut encrypted_session_key = None;
     let mut v_ack = None;
+    // Every HDCP push this head produced, in arrival order, for the trace's verdict line.
+    let mut pushes: Vec<u8> = Vec::new();
+    trace!("head {head}: downstream AKE starting");
     for (index, (id, sub, content_len)) in kvino::CP_SETUP_PER_HEAD.into_iter().enumerate() {
         if index >= 3 && encrypted_session_key.is_none() {
             // No Rrx means this connector never began a downstream authentication, which is what an
@@ -1389,6 +1545,11 @@ fn configure_head(
             // than failing the device -- aborting here took the whole dock down whenever a single
             // socket was empty, so a dock with a monitor on one connector never came up at all.
             let Some(rrx) = receiver_random else {
+                trace!(
+                    "head {head}: verdict NO downstream sink: no Rrx by step {index}; pushes \
+                     seen={}",
+                    trace_push_ids(&pushes)
+                );
                 return Ok(false);
             };
             let kd = kvino::derive_kd(&km, &rtx, &rrx).map_err(build_error("derive head kd"))?;
@@ -1465,6 +1626,7 @@ fn configure_head(
 
         let sent_at = Instant::now();
         send_interactive(dock, keys, id, *wire_seq, &content)?;
+        trace!("head {head} step {index}: sent id={id:#06x} sub={sub:#06x} len={content_len}");
         // Drain everything the dock has queued, not just the first frame. The control plane is
         // lockstep but the dock also pushes unprompted -- the per-head AKE_Send_Rrx among them --
         // so reading a single reply per message leaves the rest queued and every later read is one
@@ -1492,10 +1654,22 @@ fn configure_head(
             if let Some((msg_id, payload)) =
                 kvino::perhead_push(&keys.control_key, &keys.control_nonce, &reply)
             {
+                pushes.push(msg_id);
+                trace!(
+                    "head {head} step {index}: HDCP push {} ({msg_id:#04x}) payload={}{}",
+                    trace::hdcp_name(msg_id),
+                    trace::hex(&payload),
+                    if msg_id == kvino::ake::id::REPEATERAUTH_SEND_RECEIVERID_LIST {
+                        format!(" | {}", trace::receiver_list(&payload))
+                    } else {
+                        String::new()
+                    }
+                );
                 if msg_id == kvino::ake::id::AKE_SEND_RRX && payload.len() >= 8 && receiver_random.is_none() {
                     let mut rrx = [0u8; 8];
                     rrx.copy_from_slice(&payload[..8]);
                     receiver_random = Some(rrx);
+                    trace!("head {head} step {index}: Rrx={}", trace::hex(&rrx));
                 }
                 seen = Some(msg_id);
                 if expected == Some(msg_id) {
@@ -1506,11 +1680,19 @@ fn configure_head(
             if is_control_ack(&reply) {
                 *acknowledgements += 1;
             }
+            trace!(
+                "head {head} step {index}: non-HDCP frame: {}",
+                trace::describe(&keys.control_key, &keys.control_nonce, &reply)
+            );
         }
         if let (Some(want), None) = (expected, seen.filter(|id| expected == Some(*id))) {
             // Not fatal on its own: an empty connector answers nothing at all, and the caller
             // decides that from the missing Rrx rather than from any single step.
             eprintln!("chimera: head {head} step {index} expected HDCP push {want:#04x}, none arrived");
+            trace!(
+                "head {head} step {index}: expected push {} ({want:#04x}) never arrived",
+                trace::hdcp_name(want)
+            );
         }
         if index == 2 {
             // The dock computes H' before it will answer anything else, and the wait is the
@@ -1521,19 +1703,38 @@ fn configure_head(
                 let Some(reply) = receive_optional(dock, PERHEAD_READ_WAIT)? else {
                     break;
                 };
-                receiver_random = receiver_random
-                    .or_else(|| kvino::perhead_rrx(&keys.control_key, &keys.control_nonce, &reply));
+                let late = kvino::perhead_rrx(&keys.control_key, &keys.control_nonce, &reply);
+                if receiver_random.is_none() && late.is_some() {
+                    trace!("head {head}: Rrx arrived in the post-H' window");
+                }
+                receiver_random = receiver_random.or(late);
             }
         }
         *inner_counter = inner_counter.wrapping_add(1);
         *wire_seq = wire_seq.wrapping_add(content.len().div_ceil(16) as u32);
     }
     if encrypted_session_key.is_none() || v_ack.is_none() {
+        trace!(
+            "head {head}: verdict authentication did not complete; pushes seen={}",
+            trace_push_ids(&pushes)
+        );
         return Err(format!(
             "downstream head {head} authentication did not complete"
         ));
     }
+    trace!(
+        "head {head}: verdict downstream sink present, authenticated; pushes seen={}",
+        trace_push_ids(&pushes)
+    );
     Ok(true)
+}
+
+fn trace_push_ids(pushes: &[u8]) -> String {
+    let names: Vec<String> = pushes
+        .iter()
+        .map(|id| format!("{}({id:#04x})", trace::hdcp_name(*id)))
+        .collect();
+    format!("[{}]", names.join(", "))
 }
 
 fn send_interactive(

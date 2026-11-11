@@ -206,13 +206,21 @@ pub(crate) struct Topology {
     /// happened to place video on `0x02` while keeping a pipe of its own would still not want the
     /// serialisation, and a dock that shares a pipe at some other address would.
     pub(crate) video_on_ctrl_pipe: bool,
-    /// Number of downstream connectors the dock answers a presence probe for.
+    /// Number of video heads (display pipes) the dock drives, which is what the mode set, the
+    /// stream markers, the downstream authentication and the video records select.
     ///
-    /// This is the range of the selector at probe byte 22, and it is not the connector count: Ridge
-    /// has two of each, Navarro has four connectors feeding two video endpoints (`0x08` carried
-    /// connectors 0 then 2, `0x0a` carried 1 then 3, measured across cable moves). Connector index
-    /// is the physical socket number minus one.
+    /// It is not the video-endpoint count: Navarro has four heads feeding two video endpoints
+    /// (`0x08` carried heads 0 then 2, `0x0a` carried 1 then 3, measured across cable moves).
     pub(crate) connectors: u8,
+    /// Number of physical outputs, the range of the selector the presence probe and the EDID
+    /// requests take at byte 22.
+    ///
+    /// Outputs and heads are separate namespaces in the firmware: `id=0x16 sub=0x23` assigns an
+    /// output to a head, and DisplayLink Manager tracks the two apart. Ridge firmware has two
+    /// heads and three outputs; a Targus DOCK310 brings its HDMI socket out as output 2 and an
+    /// M/Connect 2 uses outputs 0 and 1. Local displaylink-lite patch (vendor/vino/UPSTREAM.md,
+    /// patch 17).
+    pub(crate) outputs: u8,
 }
 
 /// What a dock can be asked to drive.
@@ -605,6 +613,7 @@ pub(crate) static PROFILE_ELLA: DockProfile = DockProfile {
         video_endpoints: [0x02, 0x02, 0x02, 0x02],
         video_on_ctrl_pipe: true,
         connectors: 2,
+        outputs: 2,
         // Three, measured: the per-frame opener's slot field cycles 0, 1, 2 across 7115 records.
     },
     capabilities: Capabilities {
@@ -712,6 +721,7 @@ pub(crate) static PROFILE_RIDGE: DockProfile = DockProfile {
         video_endpoints: [0x08, 0x0b, 0x08, 0x0b],
         video_on_ctrl_pipe: false,
         connectors: 2,
+        outputs: 3,
     },
     capabilities: Capabilities {
         max_refresh_hz: u32::MAX,
@@ -792,6 +802,7 @@ pub(crate) static PROFILE_NAVARRO: DockProfile = DockProfile {
         video_endpoints: [0x08, 0x0a, 0x08, 0x0a],
         video_on_ctrl_pipe: false,
         connectors: 4,
+        outputs: 4,
     },
     capabilities: Capabilities {
         max_refresh_hz: u32::MAX,

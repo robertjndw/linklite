@@ -73,3 +73,22 @@ import Testing
         try parseConfigurationDescriptor([2, 2, 9, 0, 1, 1, 0, 0x80, 0xfa])
     }
 }
+
+@Test func dockIdentityIsReadFromTheVendorDescriptor() {
+    let config: [UInt8] = [9, 0x02, 34, 0, 1, 1, 0, 0x80, 0xfa]
+    let vendor: [UInt8] = [9, 0x04, 0, 0, 2, 0xff, 0x00, 0x03, 0]
+    let identity: [UInt8] = [16, 0x40, 12, 2, 25, 0, 0, 0] + Array("RidgeDoc".utf8)
+    let ridge = parseDockIdentity(config + vendor + identity)
+    #expect(ridge == DockIdentity(firmware: (12, 2, 25), platform: "RidgeDoc"))
+    #expect(ridge?.family?.supported == true)
+    #expect(ridge?.summary == "Identity: \"RidgeDoc\" firmware 12.2.25 - Ridge (DL-6xxx), supported")
+
+    let padded: [UInt8] = [16, 0x40, 1, 0, 0, 0, 0, 0] + Array("Ella".utf8) + [0x20, 0x20, 0, 0]
+    #expect(parseDockIdentity(config + padded)?.platform == "Ella")
+    let firefly: [UInt8] = [16, 0x40, 1, 0, 0, 0, 0, 0] + Array("FflyMoni".utf8)
+    #expect(parseDockIdentity(firefly)?.family?.supported == false)
+    let unknown: [UInt8] = [16, 0x40, 1, 0, 0, 0, 0, 0] + Array("Mystery!".utf8)
+    #expect(parseDockIdentity(unknown)?.family == nil)
+    #expect(parseDockIdentity(config + vendor) == nil)
+    #expect(parseDockIdentity([16, 0x40, 1]) == nil)
+}

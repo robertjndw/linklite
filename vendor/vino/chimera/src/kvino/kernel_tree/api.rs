@@ -788,6 +788,165 @@ pub fn encode_strip(
     Ok(video::haar::colour_strip_at(dock.geometry(), sx, sy, &mut px)?.into_vec())
 }
 
+// ---- pre-quantised strips (local displaylink-lite patch 16) ----------------
+//
+// A producer that runs the colour transform, Haar and quantiser elsewhere (the GPU) hands over
+// coefficients, and the strip is coded here by the driver's own `colour_strip`.
+
+/// Which dialect of the shared unary code a dock's decoder reads.
+///
+/// Mirrors the driver's `CodeTables`, which is module-private. A producer that packs bits itself
+/// has to spell unary codes the way the dock was told to read them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum CodeTable {
+    /// Ridge and Navarro.
+    Wide = 0,
+    /// Ella: unary and payload bits interleave, LSB first.
+    Narrow = 1,
+}
+
+/// The two bytes every strip body opens with, ahead of its `x` and `y`.
+pub const STRIP_MAGIC: [u8; 2] = [0x01, 0x28];
+
+/// An upper bound on one coded strip body, so a producer can size its buffers once.
+///
+/// The widest code is `2 * cmax + 1 <= 25` bits (10-bit chroma, `cmax` 12). Rows carry at most
+/// 16 blocks x 3 planes x 63 AC codes, 9450 bytes; main at most 16 x (two chroma nodes of 11
+/// bits, a luma node of 15, three DCs of 25) bits, 224 bytes; plus the 16-byte header and four
+/// bytes of region padding. 16 KiB covers that.
+pub const STRIP_BODY_MAX: usize = 16 * 1024;
+
+/// Everything a strip producer outside this crate needs to match the driver's coder.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StripEncoding {
+    pub strip_w: usize,
+    pub strip_h: usize,
+    /// Samples are 8-bit code words widened as `(v << 2) | (v >> 6)`.
+    pub ten_bit: bool,
+    pub code_table: CodeTable,
+    /// Escape ceilings at this depth: DC deltas, luma AC and chroma AC.
+    pub dc_cmax: u32,
+    pub ac_cmax: u32,
+    pub chroma_ac_cmax: u32,
+}
+
+impl DockProfile {
+    /// The family this profile was looked up for, or `None` for one found some other way that
+    /// is not one of the three driven families.
+    pub fn family(&self) -> Option<Family> {
+        [Family::Ella, Family::Ridge, Family::Navarro]
+            .into_iter()
+            .find(|&family| profile::for_family(family).is_some_and(|p| core::ptr::eq(p, self.profile)))
+    }
+
+    /// The strip coder's parameters for this dock at its current depth.
+    pub fn strip_encoding(&self) -> StripEncoding {
+        let geometry = self.geometry();
+        let depth = geometry.depth();
+        StripEncoding {
+            strip_w: geometry.strip_w(),
+            strip_h: geometry.strip_h(),
+            ten_bit: self.ten_bit,
+            code_table: match geometry.coding() {
+                video_arm::CodeTables::Wide => CodeTable::Wide,
+                video_arm::CodeTables::Narrow => CodeTable::Narrow,
+            },
+            dc_cmax: depth.dc_cmax(),
+            ac_cmax: depth.ac_cmax(),
+            chroma_ac_cmax: depth.chroma_ac_cmax(),
+        }
+    }
+}
+
+/// One block's quantised coefficients per plane, in the wire's Mallat order.
+///
+/// `i16` is wide enough for every value the quantiser can produce, at either depth. Samples are
+/// at most 10 bits, so `colour` gives `|Cb|, |Cr| <= 64 * 1023 = 65472` and `0 <= Y <= 65472`.
+/// The Haar is floor-divided by 64 once: the DC is the block mean, and an AC coefficient at
+/// level `l` (3 coarsest) is a signed sum of `4^l` samples over 64, at most half the plane's
+/// spread, so `|AC| <= 65472` for chroma and `<= 32736` for luma before quantising. The
+/// quantiser then shifts by at least 4 (chroma AC 4..6, chroma DC 6, luma DC 4) or clamps to
+/// `-2048..=2047` (luma AC), so no quantised magnitude exceeds `(65472 + 8) >> 4 = 4092`.
+/// `quantised_coefficients_stay_within_the_i16_bound` checks this on the worst patterns.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(C)]
+pub struct QuantBlock {
+    pub cr: [i16; 64],
+    pub cb: [i16; 64],
+    pub y: [i16; 64],
+}
+
+impl QuantBlock {
+    pub const ZERO: Self = Self { cr: [0; 64], cb: [0; 64], y: [0; 64] };
+}
+
+/// The CPU reference for a producer's colour, transform and quantise stage: the 16 blocks of the
+/// strip whose top-left pixel is `(sx, sy)`, in the order [`encode_strip_quantized`] takes them.
+///
+/// Reads `rgb` exactly as [`encode_strip`] does, so
+/// `encode_strip_quantized(quantize_strip(..))` is `encode_strip(..)`.
+pub fn quantize_strip(
+    dock: DockProfile,
+    width: usize,
+    rgb: &[u8],
+    sx: usize,
+    sy: usize,
+) -> Result<[QuantBlock; 16]> {
+    let mut px = RgbRows {
+        ten_bit: dock.ten_bit,
+        width,
+        rgb,
+    };
+    let blocks = video::haar::colour_strip_blocks(dock.geometry(), sx, sy, &mut px)?;
+    let narrow = |q: &[i32; 64]| -> Result<[i16; 64]> {
+        let mut out = [0i16; 64];
+        for (o, &v) in out.iter_mut().zip(q) {
+            // Unreachable by the bound on `QuantBlock`; refusing beats a silent wrap.
+            *o = i16::try_from(v).map_err(|_| EINVAL)?;
+        }
+        Ok(out)
+    };
+    let mut out = [QuantBlock::ZERO; 16];
+    for (o, b) in out.iter_mut().zip(blocks.iter()) {
+        *o = QuantBlock {
+            cr: narrow(&b.qcr)?,
+            cb: narrow(&b.qcb)?,
+            y: narrow(&b.qy)?,
+        };
+    }
+    Ok(out)
+}
+
+/// Code one strip at `(sx, sy)` from coefficients quantised elsewhere.
+///
+/// The last significant positions are recomputed here with the coder's own `last_significant`
+/// rather than taken from the producer: a last that disagrees with the coefficients codes a
+/// strip the dock decodes as garbage while every record stays the right length.
+pub fn encode_strip_quantized(
+    dock: DockProfile,
+    sx: usize,
+    sy: usize,
+    blocks: &[QuantBlock; 16],
+) -> Result<Vec<u8>> {
+    let (Ok(x), Ok(y)) = (u16::try_from(sx), u16::try_from(sy)) else {
+        return Err(EINVAL);
+    };
+    let widen = |q: &[i16; 64]| -> [i32; 64] { core::array::from_fn(|i| i32::from(q[i])) };
+    let coded: [video::haar::ColourBlock; 16] = core::array::from_fn(|k| {
+        let (qcr, qcb, qy) = (widen(&blocks[k].cr), widen(&blocks[k].cb), widen(&blocks[k].y));
+        video::haar::ColourBlock {
+            lcr: video::haar::last_significant(&qcr),
+            lcb: video::haar::last_significant(&qcb),
+            ly: video::haar::last_significant(&qy),
+            qcr,
+            qcb,
+            qy,
+        }
+    });
+    Ok(video::haar::colour_strip(dock.geometry(), &coded, x, y)?.into_vec())
+}
+
 /// `video::haar::frame_records` -- frame encoded strip bodies into video records.
 ///
 /// The generic interlaced order, on every dock and for every frame.
@@ -1919,5 +2078,147 @@ mod production_builders {
             }
         }
         Ok(())
+    }
+}
+
+/// Local displaylink-lite patch 16: strips coded from coefficients quantised elsewhere.
+#[cfg(test)]
+mod quantized_strips {
+    use super::*;
+
+    const FAMILIES: [Family; 3] = [Family::Ella, Family::Ridge, Family::Navarro];
+    /// A whole number of strips on every family: 4x2 Ridge strips, 2x4 Navarro ones.
+    const W: usize = 256;
+    const H: usize = 32;
+
+    fn docks() -> impl Iterator<Item = DockProfile> {
+        FAMILIES.into_iter().flat_map(|family| {
+            let dock = DockProfile::for_family(family).expect("a driven family");
+            [dock, dock.ten_bit()]
+        })
+    }
+
+    fn surface(pixel: impl Fn(usize, usize) -> [u8; 3]) -> Vec<u8> {
+        (0..W * H).flat_map(|i| pixel(i % W, i / W)).collect()
+    }
+
+    fn patterns() -> Vec<(&'static str, Vec<u8>)> {
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let noise: Vec<u8> = (0..W * H * 3)
+            .map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                (seed >> 24) as u8
+            })
+            .collect();
+        let ext = |on: bool| if on { 255 } else { 0 };
+        vec![
+            ("flat", surface(|_, _| [0x20, 0x20, 0x20])),
+            ("noise", noise),
+            ("extremes", surface(|x, y| [ext((x ^ y) & 1 == 1), ext(x & 2 == 0), ext((x + y) & 4 == 0)])),
+            ("gradients", surface(|x, y| [x as u8, (y * 8) as u8, (x + y * 3) as u8])),
+            ("chroma only", surface(|x, y| {
+                let d = ((x * 7 + y * 13) % 128) as u8;
+                [128 + d.min(127), 128, 128 - d]
+            })),
+            ("block edges", surface(|x, y| {
+                let on = (x / 8 + y / 8) % 2 == 0;
+                [ext(on), ext(!on), ext(on)]
+            })),
+            ("one-pixel gratings", surface(|x, y| [ext(x % 2 == 0), ext(y % 2 == 0), 0x80])),
+        ]
+    }
+
+    #[test]
+    fn quantised_strips_code_to_the_bytes_encode_strip_produces() -> Result {
+        for dock in docks() {
+            for (name, rgb) in patterns() {
+                for (sx, sy) in strip_coords(dock, W, H, None)? {
+                    let blocks = quantize_strip(dock, W, &rgb, sx, sy)?;
+                    assert_eq!(
+                        encode_strip_quantized(dock, sx, sy, &blocks)?,
+                        encode_strip(dock, W, &rgb, sx, sy)?,
+                        "{} ten_bit={} {name} strip ({sx}, {sy})",
+                        dock.name(),
+                        dock.is_ten_bit()
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The bound stated on `QuantBlock`: two-colour splits at every Haar level and orientation,
+    /// between the colours that spread each plane furthest, at 10 bits.
+    #[test]
+    fn quantised_coefficients_stay_within_the_i16_bound() -> Result {
+        let splits: [fn(usize, usize) -> bool; 9] = [
+            |x, _| x & 4 == 0,
+            |_, y| y & 4 == 0,
+            |x, y| (x ^ y) & 4 == 0,
+            |x, _| x & 2 == 0,
+            |_, y| y & 2 == 0,
+            |x, y| (x ^ y) & 2 == 0,
+            |x, _| x & 1 == 0,
+            |_, y| y & 1 == 0,
+            |x, y| (x ^ y) & 1 == 0,
+        ];
+        let pairs = [
+            ([255, 0, 255], [0, 255, 0]),
+            ([255, 0, 0], [0, 255, 255]),
+            ([0, 0, 255], [255, 255, 0]),
+            ([255, 255, 255], [0, 0, 0]),
+        ];
+        let mut widest = 0i16;
+        for dock in docks().filter(DockProfile::is_ten_bit) {
+            for split in splits {
+                for (a, b) in pairs {
+                    let rgb = surface(|x, y| if split(x, y) { a } else { b });
+                    for (sx, sy) in strip_coords(dock, W, H, None)? {
+                        for block in quantize_strip(dock, W, &rgb, sx, sy)? {
+                            for v in block.cr.iter().chain(&block.cb).chain(&block.y) {
+                                widest = widest.max(v.saturating_abs());
+                            }
+                        }
+                        let body = encode_strip(dock, W, &rgb, sx, sy)?;
+                        assert!(body.len() <= STRIP_BODY_MAX);
+                    }
+                }
+            }
+        }
+        assert!(widest <= 4092, "widest quantised coefficient {widest}");
+        // The patterns do reach the far end of the range, so the bound is not vacuous.
+        assert!(widest >= 2047, "widest quantised coefficient {widest}");
+        Ok(())
+    }
+
+    #[test]
+    fn strip_encoding_states_each_docks_coder() -> Result {
+        let ella = DockProfile::for_family(Family::Ella).unwrap().strip_encoding();
+        let ridge = DockProfile::for_family(Family::Ridge).unwrap().strip_encoding();
+        let navarro = DockProfile::for_family(Family::Navarro).unwrap();
+        assert_eq!((ella.strip_w, ella.strip_h, ella.code_table), (64, 16, CodeTable::Narrow));
+        assert_eq!((ridge.strip_w, ridge.strip_h, ridge.code_table), (64, 16, CodeTable::Wide));
+        let (eight, ten) = (navarro.strip_encoding(), navarro.ten_bit().strip_encoding());
+        assert_eq!((eight.strip_w, eight.strip_h, eight.code_table), (128, 8, CodeTable::Wide));
+        assert_eq!((eight.dc_cmax, eight.ac_cmax, eight.chroma_ac_cmax), (10, 9, 10));
+        assert_eq!((ten.dc_cmax, ten.ac_cmax, ten.chroma_ac_cmax, ten.ten_bit), (12, 11, 12, true));
+        for family in FAMILIES {
+            let dock = DockProfile::for_family(family).unwrap();
+            assert_eq!(dock.family(), Some(family));
+            let body = encode_strip(dock, W, &vec![0x40; W * H * 3], 0, 0)?;
+            assert_eq!(body[..2], STRIP_MAGIC);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_strip_beyond_the_wire_coordinates_is_refused() {
+        let dock = DockProfile::for_family(Family::Ridge).unwrap();
+        let blocks = [QuantBlock::ZERO; 16];
+        assert!(encode_strip_quantized(dock, 1 << 16, 0, &blocks).is_err());
+        assert!(encode_strip_quantized(dock, 0, 1 << 16, &blocks).is_err());
+        assert!(encode_strip_quantized(dock, 64, 16, &blocks).is_ok());
     }
 }

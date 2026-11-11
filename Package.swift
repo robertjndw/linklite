@@ -14,7 +14,8 @@ let package = Package(
     platforms: [.macOS(.v14)],
     products: [
         .executable(name: "dlprobe", targets: ["dlprobe"]),
-        .executable(name: "LinkLite", targets: ["LinkLite"])
+        .executable(name: "LinkLite", targets: ["LinkLite"]),
+        .executable(name: "linklite-bench", targets: ["linklite-bench"])
     ],
     dependencies: [
         .package(url: "https://github.com/sparkle-project/Sparkle", exact: "2.10.1")
@@ -36,10 +37,20 @@ let package = Package(
                 .linkedFramework("CoreGraphics")
             ]
         ),
+        // The Metal strip encoder. A library of its own so its tests and the benchmark link it.
+        .target(
+            name: "LinkLiteGPU",
+            dependencies: ["CDLLite"],
+            linkerSettings: [
+                .linkedFramework("Metal"),
+                .linkedFramework("CoreVideo")
+            ]
+        ),
         .executableTarget(
             name: "LinkLite",
             dependencies: [
                 "CDLLite",
+                "LinkLiteGPU",
                 .product(name: "Sparkle", package: "Sparkle")
             ],
             linkerSettings: [
@@ -50,9 +61,22 @@ let package = Package(
                 .unsafeFlags(["-Xlinker", "-rpath", "-Xlinker", "@executable_path/../Frameworks"])
             ]
         ),
+        // Records clips for the replay benchmark and replays them through the engine's pixel path,
+        // fed by the CPU or the Metal encoder (docs/BENCHMARK.md). Needs no dock.
+        .executableTarget(
+            name: "linklite-bench",
+            dependencies: ["CDLLite", "LinkLiteGPU"],
+            linkerSettings: [
+                .linkedFramework("ScreenCaptureKit")
+            ]
+        ),
         .testTarget(
             name: "DLProbeCoreTests",
             dependencies: ["DLProbeCore"]
+        ),
+        .testTarget(
+            name: "LinkLiteGPUTests",
+            dependencies: ["LinkLiteGPU", "CDLLite"]
         )
     ]
 )

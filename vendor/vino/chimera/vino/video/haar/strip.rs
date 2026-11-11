@@ -353,7 +353,7 @@ fn quant_luma<const LO: usize, const HI: usize, const S: u32, const B: i32>(
 /// A branch-free max over `i` where `q[i] != 0` rather than an early-exit reverse scan, so it
 /// vectorises where the target allows. Position 0 (the DC) only ever contributes 0.
 #[inline(always)]
-fn last_significant(q: &[i32; COEFFS]) -> usize {
+pub(crate) fn last_significant(q: &[i32; COEFFS]) -> usize {
     let mut last = 0u32;
     for (i, &v) in (0u32..).zip(q) {
         last = last.max(if v != 0 { i } else { 0 });

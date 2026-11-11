@@ -4,12 +4,15 @@
 //! display host hands over. Follows the vendored chimera daemon's session loop, with the Linux
 //! virtual-display card replaced by per-head mailboxes the macOS host fills.
 
+#[doc(hidden)]
+pub mod bench;
+
 use crate::edid::{self, Monitor};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
-use vino_chimera::kvino::DockProfile;
-use vino_chimera::session::{ControlSession, PresentTiming};
+use vino_chimera::kvino::{self, DockProfile, Family, StripEncoding};
+use vino_chimera::session::{ControlSession, PresentEncodedError, PresentTiming};
 use vino_chimera::pool::STREAMING_THREADS;
 use vino_chimera::scanout::StripHasher;
 use vino_chimera::MAX_CONNECTORS;
@@ -115,6 +118,22 @@ struct Accepting {
     padded_height: usize,
     strip_w: usize,
     strip_h: usize,
+    /// What a producer that codes strips itself must match; `None` for a dock the vendored
+    /// profile table cannot name, which can then only be fed surfaces.
+    encoder: Option<EncoderProfile>,
+}
+
+/// The dock a head's strips are coded for, as an outside strip producer needs to know it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EncoderProfile {
+    pub family: Family,
+    pub encoding: StripEncoding,
+}
+
+impl EncoderProfile {
+    fn of(profile: DockProfile) -> Option<Self> {
+        Some(Self { family: profile.family()?, encoding: profile.strip_encoding() })
+    }
 }
 
 impl Accepting {
@@ -137,6 +156,37 @@ pub(crate) fn frame_len(stride: usize, width: usize, height: usize) -> Option<us
         .checked_mul(height - 1)?
         .checked_add(row_bytes)
         .filter(|len| *len <= isize::MAX as usize)
+}
+
+/// Strips a producer hashed and coded itself, waiting for the engine (see
+/// [`Shared::submit_encoded`]).
+#[derive(Default)]
+struct EncodedStrips {
+    /// The newest hash and body of each strip. A strip coded again before the engine takes it
+    /// replaces its older copy: only the content on screen now is worth sending.
+    strips: Vec<Option<(u64, Vec<u8>)>>,
+    /// Indices of the `Some` entries of `strips`, in the order they first arrived.
+    changed: Vec<usize>,
+}
+
+/// What [`Shared::take`] hands the engine.
+#[derive(Debug, PartialEq, Eq)]
+enum Taken {
+    /// The surface in the shadow moved: in these strip-aligned areas, or (`None`) everywhere.
+    Surface(Option<Vec<Rect>>),
+    /// These strips were coded again, as `(index, hash, body)`.
+    Encoded(Vec<(usize, u64, Vec<u8>)>),
+}
+
+/// How a head was last fed, which decides how its owed retransmissions are presented.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Feed {
+    /// Nothing presented yet.
+    Nothing,
+    /// From the RGB shadow.
+    Surface,
+    /// From strip bodies the scanout caches.
+    Encoded,
 }
 
 #[derive(Default)]
@@ -162,6 +212,20 @@ struct Mailbox {
     /// the surface out. Capture returns pre-gamma pixels, so the host hands the table over.
     /// `None` is identity. Survives mode changes: it belongs to the display, not the mode.
     gamma: Option<[[u8; 256]; 3]>,
+    /// `Some` while the head is fed coded strips rather than BGRA frames; the surface fields
+    /// above are then unused. Whichever kind of submit comes first after a reset picks the mode.
+    encoded: Option<EncodedStrips>,
+    /// A strip producer must code every strip from scratch: the head has a fresh mailbox, the
+    /// gamma table changed (the producer applies it), or the scanout lacked a body it needed.
+    full_request: bool,
+}
+
+impl Mailbox {
+    /// An empty mailbox for `accepting` that keeps the display's gamma table.
+    fn reset(&mut self, accepting: Option<Accepting>) {
+        let gamma = self.gamma;
+        *self = Mailbox { accepting, gamma, full_request: accepting.is_some(), ..Mailbox::default() };
+    }
 }
 
 /// A pointer image for the dock's hardware cursor: BGRA, top row first, tightly packed.
@@ -206,6 +270,8 @@ struct HeadCounters {
     pack_ns: AtomicU64,
     usb_ns: AtomicU64,
     poll_ns: AtomicU64,
+    /// GPU time a strip producer reports for this head.
+    gpu_ns: AtomicU64,
 }
 
 impl HeadCounters {
@@ -264,7 +330,8 @@ pub struct HeadStats {
     pub coarse_fallbacks: u64,
     /// Video bytes submitted to the dock.
     pub bytes_sent: u64,
-    /// Capture-side hashing and BGRA→RGB conversion, including the mailbox lock wait.
+    /// Capture-side hashing and BGRA→RGB conversion, including the mailbox lock wait; for coded
+    /// strips, checking and copying the bodies.
     pub submit_us: u64,
     /// Engine-side copy of changed strips out of the mailbox, on every lit, in-budget visit.
     pub take_us: u64,
@@ -275,6 +342,8 @@ pub struct HeadStats {
     /// Video endpoint submission (`submit_video`).
     pub usb_us: u64,
     pub poll_us: u64,
+    /// GPU time a strip producer reported ([`Shared::add_gpu_time`]).
+    pub gpu_us: u64,
 }
 
 /// Engine-wide counters over a [`Shared::take_stats`] interval, and each attached head's.
@@ -376,6 +445,9 @@ impl Shared {
         let Some(len) = frame_len(stride, width, height) else { return false };
         if (a.width, a.height) != (width, height) || bgra.len() < len {
             return false;
+        }
+        if mailbox.encoded.is_some() {
+            mailbox.reset(Some(a));
         }
         let (tiles_x, tiles_y) = a.tiles();
         let fresh = mailbox.surface.len() != a.padded_width * 3 * a.padded_height;
@@ -484,6 +556,8 @@ impl Shared {
             return;
         }
         mailbox.gamma = lut;
+        // A producer that codes strips itself applies the table, so it has to code them all again.
+        mailbox.full_request |= mailbox.accepting.is_some();
         {
             // The dock draws the pointer itself, so it gets the same table (see sync_cursor).
             let mut cursor_gamma = self.cursor_gamma[head].lock().unwrap();
@@ -499,30 +573,143 @@ impl Shared {
         self.notify();
     }
 
-    fn open(&self, head: usize, accepting: Accepting) {
+    /// Accept strips a producer hashed and coded itself, as `(strip index, hash, body)`: the
+    /// alternative to [`Shared::submit_frame`] for a producer that does the pixel work (the GPU
+    /// encoder). Indices are raster order over the padded surface's strips; hashes are the
+    /// producer's own, only ever compared with each other, and never 0. Each body must be the
+    /// strip coded for this head's [`EncoderProfile`], and is copied before this returns.
+    ///
+    /// The whole submission is refused, and nothing queued, when anything in it does not fit the
+    /// head: a frame size other than its mode, a depth other than its link's, an index outside
+    /// the surface, a zero hash, or a body that is not a strip at that index's position. A depth
+    /// mismatch also asks for every strip again. Returns whether the strips were accepted.
+    pub fn submit_encoded<'a>(
+        &self,
+        head: usize,
+        width: usize,
+        height: usize,
+        ten_bit: bool,
+        strips: impl IntoIterator<Item = (usize, u64, &'a [u8])>,
+    ) -> bool {
+        let Some(counters) = self.perf.heads.get(head) else { return false };
+        let started = Instant::now();
+        let Some(a) = self.mailboxes[head].lock().unwrap().accepting else { return false };
+        if (a.width, a.height) != (width, height) {
+            return false;
+        }
+        if a.encoder.is_some_and(|encoder| encoder.encoding.ten_bit != ten_bit) {
+            self.request_full(head);
+            return false;
+        }
+        // Checked and copied before the lock is taken again, so a large submission never holds
+        // the engine off its mailbox.
+        let (tiles_x, tiles_y) = a.tiles();
+        let mut copied = Vec::new();
+        for (index, hash, body) in strips {
+            let (sx, sy) = ((index % tiles_x.max(1)) * a.strip_w, (index / tiles_x.max(1)) * a.strip_h);
+            if index >= tiles_x * tiles_y || hash == 0 || !is_strip_at(body, sx, sy) {
+                return false;
+            }
+            copied.push((index, hash, body.to_vec()));
+        }
+
+        let mut guard = self.mailboxes[head].lock().unwrap();
+        let mailbox = &mut *guard;
+        // The head may have been re-opened at another mode while the bodies were copied.
+        if mailbox.accepting != Some(a) {
+            return false;
+        }
+        if mailbox.encoded.is_none() {
+            if !mailbox.surface.is_empty() {
+                mailbox.reset(Some(a));
+            }
+            mailbox.encoded = Some(EncodedStrips { strips: vec![None; tiles_x * tiles_y], changed: Vec::new() });
+        }
+        let encoded = mailbox.encoded.as_mut().expect("set above");
+        let any = !copied.is_empty();
+        for (index, hash, body) in copied {
+            if encoded.strips[index].replace((hash, body)).is_none() {
+                encoded.changed.push(index);
+            }
+        }
+        counters.frames_submitted.fetch_add(1, Ordering::Relaxed);
+        if any {
+            counters.frame_ready.store(true, Ordering::Relaxed);
+        }
+        drop(guard);
+        add_elapsed(&counters.submit_ns, started);
+        if any {
+            self.notify();
+        }
+        true
+    }
+
+    /// Whether the head's strip producer must code every strip from scratch, clearing the
+    /// request. The producer polls this before each frame.
+    pub fn take_full_request(&self, head: usize) -> bool {
+        self.mailboxes
+            .get(head)
+            .is_some_and(|slot| core::mem::take(&mut slot.lock().unwrap().full_request))
+    }
+
+    fn request_full(&self, head: usize) {
         let mut mailbox = self.mailboxes[head].lock().unwrap();
-        let gamma = mailbox.gamma;
-        *mailbox = Mailbox { accepting: Some(accepting), gamma, ..Mailbox::default() };
+        mailbox.full_request |= mailbox.accepting.is_some();
+    }
+
+    /// What a strip producer for `head` must match, while the head accepts frames.
+    pub fn encoder_profile(&self, head: usize) -> Option<(EncoderProfile, usize, usize)> {
+        let a = self.mailboxes.get(head)?.lock().unwrap().accepting?;
+        Some((a.encoder?, a.padded_width, a.padded_height))
+    }
+
+    /// Add GPU time a strip producer spent on `head` to its performance counters.
+    pub fn add_gpu_time(&self, head: usize, elapsed: Duration) {
+        if let Some(counters) = self.perf.heads.get(head) {
+            add_duration(&counters.gpu_ns, elapsed);
+        }
+    }
+
+    /// Open `head` as attaching a `width` x `height` mode on `profile` would, with no dock.
+    #[cfg(test)]
+    pub(crate) fn open_for_tests(&self, head: usize, profile: DockProfile, width: usize, height: usize) {
+        let (padded_width, padded_height) = padded(profile, width, height);
+        let (strip_w, strip_h) = profile.strip_dims();
+        let encoder = EncoderProfile::of(profile);
+        self.open(head, Accepting { width, height, padded_width, padded_height, strip_w, strip_h, encoder });
+    }
+
+    fn open(&self, head: usize, accepting: Accepting) {
+        self.mailboxes[head].lock().unwrap().reset(Some(accepting));
         self.perf.heads[head].frame_ready.store(false, Ordering::Relaxed);
         self.perf.heads[head].attached.store(true, Ordering::Relaxed);
     }
 
     fn close(&self, head: usize) {
-        let mut mailbox = self.mailboxes[head].lock().unwrap();
-        let gamma = mailbox.gamma;
-        *mailbox = Mailbox { gamma, ..Mailbox::default() };
+        self.mailboxes[head].lock().unwrap().reset(None);
         self.perf.heads[head].frame_ready.store(false, Ordering::Relaxed);
         self.perf.heads[head].attached.store(false, Ordering::Relaxed);
     }
 
-    /// Bring `shadow` up to the head's latest surface if it changed, returning the strip-aligned
-    /// areas that changed (`Some(None)`: all of it). Copies only those areas.
-    fn take_frame(&self, head: usize, shadow: &mut Vec<u8>) -> Option<Option<Vec<Rect>>> {
+    /// Whatever the head's producer left since the last call: strips it coded, or for a surface,
+    /// `shadow` brought up to date with the strip-aligned areas that changed (`None`: all of it).
+    /// Copies only those areas.
+    fn take(&self, head: usize, shadow: &mut Vec<u8>) -> Option<Taken> {
         let mut guard = self.mailboxes[head].lock().unwrap();
         // Whatever this returns, the mailbox holds nothing new once it does.
         self.perf.heads[head].frame_ready.store(false, Ordering::Relaxed);
         let mailbox = &mut *guard;
         let a = mailbox.accepting?;
+        if let Some(EncodedStrips { strips, changed }) = &mut mailbox.encoded {
+            if changed.is_empty() {
+                return None;
+            }
+            let bodies = changed
+                .drain(..)
+                .filter_map(|index| strips[index].take().map(|(hash, body)| (index, hash, body)))
+                .collect();
+            return Some(Taken::Encoded(bodies));
+        }
         if !mailbox.all_changed && mailbox.changed_count == 0 {
             return None;
         }
@@ -539,7 +726,7 @@ impl Shared {
             mailbox.changed.fill(false);
             mailbox.changed_count = 0;
             mailbox.all_changed = false;
-            return Some(None);
+            return Some(Taken::Surface(None));
         }
         // Runs of changed strips along each strip row become one rectangle each.
         let row = a.padded_width * 3;
@@ -569,7 +756,7 @@ impl Shared {
             }
         }
         mailbox.changed_count = 0;
-        Some(Some(rects))
+        Some(Taken::Surface(Some(rects)))
     }
 
     fn take_power(&self, head: usize) -> Option<bool> {
@@ -598,6 +785,7 @@ impl Shared {
                     pack_us: take_us(&c.pack_ns),
                     usb_us: take_us(&c.usb_ns),
                     poll_us: take_us(&c.poll_ns),
+                    gpu_us: take_us(&c.gpu_ns),
                 };
                 c.attached.load(Ordering::Relaxed).then_some(stats)
             }),
@@ -712,6 +900,14 @@ fn bgra_strip_hash(bgra: &[u8], stride: usize, x0: usize, y0: usize, cols: usize
     h.finish() | 1 // never 0, which marks a strip whose pixels are not yet known
 }
 
+/// Whether `body` reads as a coded strip whose top-left pixel is `(sx, sy)`. A body filed under
+/// the wrong index would be framed at that index's place in the records yet decoded at its own
+/// coordinates, painting it twice and leaving a hole.
+fn is_strip_at(body: &[u8], sx: usize, sy: usize) -> bool {
+    let at = |i: usize| usize::from(u16::from_le_bytes([body[i], body[i + 1]]));
+    body.len() >= 16 && body[..2] == kvino::STRIP_MAGIC && at(2) == sx && at(4) == sy
+}
+
 fn padded(profile: DockProfile, width: usize, height: usize) -> (usize, usize) {
     let (strip_w, strip_h) = profile.strip_dims();
     (width.div_ceil(strip_w) * strip_w, height.div_ceil(strip_h) * strip_h)
@@ -723,7 +919,9 @@ struct Output {
     padded_width: usize,
     padded_height: usize,
     /// The surface last handed to the codec. Updated in place from the mailbox's changed areas.
+    /// Empty while the head is fed coded strips.
     shadow: Vec<u8>,
+    feed: Feed,
     /// The EDID this head was lit with, used to reject the other socket's monitor echoed back
     /// by a shared EDID handler.
     edid: Vec<u8>,
@@ -914,7 +1112,7 @@ fn run_session(
             }
             let counters = &shared.perf.heads[head];
             if !budget.available() {
-                let repaint_due = !output.shadow.is_empty()
+                let repaint_due = output.feed != Feed::Nothing
                     && session.owes_repaint(head as u8)
                     && Instant::now() >= output.next_repaint;
                 if counters.frame_ready.load(Ordering::Relaxed) || repaint_due {
@@ -923,16 +1121,27 @@ fn run_session(
                 continue;
             }
             let now = Instant::now();
-            let taken = shared.take_frame(head, &mut output.shadow);
+            let taken = shared.take(head, &mut output.shadow);
             add_elapsed(&counters.take_ns, now);
-            if let Some(dirty) = taken {
-                let sent = session.present_rgb_dirty(
-                    head as u8,
-                    output.padded_width,
-                    output.padded_height,
-                    &output.shadow,
-                    dirty.as_deref(),
-                )?;
+            if let Some(taken) = taken {
+                let sent = match taken {
+                    Taken::Surface(dirty) => {
+                        output.feed = Feed::Surface;
+                        session.present_rgb_dirty(
+                            head as u8,
+                            output.padded_width,
+                            output.padded_height,
+                            &output.shadow,
+                            dirty.as_deref(),
+                        )?
+                    }
+                    Taken::Encoded(bodies) => {
+                        output.feed = Feed::Encoded;
+                        // A shadow kept from a surface feed would go stale unseen.
+                        output.shadow = Vec::new();
+                        present_encoded(shared, &mut session, output, head, bodies)?
+                    }
+                };
                 counters.record_present(sent, session.last_present());
                 budget.spend(sent);
                 output.last_change = now;
@@ -949,15 +1158,19 @@ fn run_session(
             // Owed retransmissions go out one refresh apart, so each lands in a different dock
             // buffer however the dock times its buffer swaps.
             if now >= output.next_repaint && session.owes_repaint(head as u8) {
-                if !output.shadow.is_empty() {
-                    // Nothing new since the last present, so no strip needs re-hashing.
-                    let sent = session.present_rgb_dirty(
+                // Nothing new since the last present, so no strip needs re-hashing.
+                let sent = match output.feed {
+                    Feed::Nothing => None,
+                    Feed::Surface => Some(session.present_rgb_dirty(
                         head as u8,
                         output.padded_width,
                         output.padded_height,
                         &output.shadow,
                         Some(&[]),
-                    )?;
+                    )?),
+                    Feed::Encoded => Some(present_encoded(shared, &mut session, output, head, Vec::new())?),
+                };
+                if let Some(sent) = sent {
                     counters.record_present(sent, session.last_present());
                     budget.spend(sent);
                     output.next_repaint = now + refresh_period(output.mode);
@@ -1006,6 +1219,27 @@ fn run_session(
         }
     }
     Ok(())
+}
+
+/// Present strips a producer coded, or (with no bodies) what the head still owes from earlier
+/// ones. A selected strip the scanout holds no current body for sends nothing and asks the
+/// producer to code every strip again; that is recoverable, so it does not end the session.
+fn present_encoded(
+    shared: &Shared,
+    session: &mut ControlSession,
+    output: &Output,
+    head: usize,
+    bodies: Vec<(usize, u64, Vec<u8>)>,
+) -> Result<usize, String> {
+    let changed: Vec<(usize, u64)> = bodies.iter().map(|&(index, hash, _)| (index, hash)).collect();
+    match session.present_encoded(head as u8, output.padded_width, output.padded_height, &changed, bodies) {
+        Ok(sent) => Ok(sent),
+        Err(PresentEncodedError::MissingBody { .. }) => {
+            shared.request_full(head);
+            Ok(0)
+        }
+        Err(PresentEncodedError::Session(error)) => Err(error),
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1082,7 +1316,15 @@ fn attach(
     let (strip_w, strip_h) = session.profile().strip_dims();
     shared.open(
         usize::from(head),
-        Accepting { width: mode.width, height: mode.height, padded_width, padded_height, strip_w, strip_h },
+        Accepting {
+            width: mode.width,
+            height: mode.height,
+            padded_width,
+            padded_height,
+            strip_w,
+            strip_h,
+            encoder: EncoderProfile::of(session.profile()),
+        },
     );
     events.attached(head, &monitor, mode, &edid_bytes, session.profile().hw_cursor());
     outputs[usize::from(head)] = Some(Output {
@@ -1091,6 +1333,7 @@ fn attach(
         padded_width,
         padded_height,
         shadow: Vec::new(),
+        feed: Feed::Nothing,
         edid: edid_bytes,
         presence_debounce: 0,
         silent_probes: 0,
@@ -1236,7 +1479,185 @@ mod tests {
 
     /// A surface whose codec strips are `strip_w` x `strip_h` (1x1 makes every pixel a strip).
     fn accepting(width: usize, height: usize, padded_width: usize, padded_height: usize) -> Accepting {
-        Accepting { width, height, padded_width, padded_height, strip_w: 1, strip_h: 1 }
+        Accepting { width, height, padded_width, padded_height, strip_w: 1, strip_h: 1, encoder: None }
+    }
+
+    impl Shared {
+        /// [`Shared::take`] for a head fed surfaces.
+        fn take_frame(&self, head: usize, shadow: &mut Vec<u8>) -> Option<Option<Vec<Rect>>> {
+            self.take(head, shadow).map(|taken| match taken {
+                Taken::Surface(dirty) => dirty,
+                Taken::Encoded(_) => panic!("expected a surface, got coded strips"),
+            })
+        }
+
+        fn take_encoded(&self, head: usize) -> Option<Vec<(usize, u64, Vec<u8>)>> {
+            self.take(head, &mut Vec::new()).map(|taken| match taken {
+                Taken::Encoded(bodies) => bodies,
+                Taken::Surface(_) => panic!("expected coded strips, got a surface"),
+            })
+        }
+    }
+
+    /// A 4x2 surface of 2x1 strips: indices 0, 1 on the top row and 2, 3 below.
+    fn small_encoded() -> Accepting {
+        Accepting { strip_w: 2, ..accepting(4, 2, 4, 2) }
+    }
+
+    /// A stand-in strip body: the header a coded strip at `(sx, sy)` starts with, and `tag`.
+    fn body(sx: u16, sy: u16, tag: u8) -> Vec<u8> {
+        let mut body = vec![0u8; 17];
+        body[..2].copy_from_slice(&kvino::STRIP_MAGIC);
+        body[2..4].copy_from_slice(&sx.to_le_bytes());
+        body[4..6].copy_from_slice(&sy.to_le_bytes());
+        body[16] = tag;
+        body
+    }
+
+    fn strip_xy(index: usize) -> (u16, u16) {
+        ((index % 2 * 2) as u16, (index / 2) as u16)
+    }
+
+    fn submit(shared: &Shared, strips: &[(usize, u64, u8)]) -> bool {
+        let bodies: Vec<(usize, u64, Vec<u8>)> = strips
+            .iter()
+            .map(|&(index, hash, tag)| {
+                let (sx, sy) = strip_xy(index);
+                (index, hash, body(sx, sy, tag))
+            })
+            .collect();
+        shared.submit_encoded(0, 4, 2, false, bodies.iter().map(|(i, h, b)| (*i, *h, b.as_slice())))
+    }
+
+    fn taken(strips: &[(usize, u64, u8)]) -> Vec<(usize, u64, Vec<u8>)> {
+        strips
+            .iter()
+            .map(|&(index, hash, tag)| {
+                let (sx, sy) = strip_xy(index);
+                (index, hash, body(sx, sy, tag))
+            })
+            .collect()
+    }
+
+    /// A strip coded again before the engine looks replaces its older copy, keeping its place.
+    #[test]
+    fn encoded_strips_coalesce_with_the_last_write_winning() {
+        let shared = Shared::new();
+        shared.open(0, small_encoded());
+        assert!(submit(&shared, &[(2, 11, 1), (0, 12, 2)]));
+        assert!(shared.perf.heads[0].frame_ready.load(Ordering::Relaxed));
+        assert!(submit(&shared, &[(0, 13, 3), (3, 14, 4)]));
+        assert_eq!(shared.take_encoded(0), Some(taken(&[(2, 11, 1), (0, 13, 3), (3, 14, 4)])));
+        assert!(!shared.perf.heads[0].frame_ready.load(Ordering::Relaxed));
+        assert_eq!(shared.take_encoded(0), None);
+        // An empty submission is accepted and wakes nobody.
+        assert!(submit(&shared, &[]));
+        assert!(!shared.perf.heads[0].frame_ready.load(Ordering::Relaxed));
+        assert_eq!(shared.take_encoded(0), None);
+        assert!(submit(&shared, &[(1, 15, 5)]));
+        assert_eq!(shared.take_encoded(0), Some(taken(&[(1, 15, 5)])));
+        assert_eq!(shared.take_stats().heads[0].unwrap().frames_submitted, 4);
+    }
+
+    /// Anything that does not fit the head refuses the whole submission.
+    #[test]
+    fn encoded_submissions_that_do_not_fit_the_head_queue_nothing() {
+        let shared = Shared::new();
+        let try_submit = |strips: Vec<(usize, u64, Vec<u8>)>| {
+            shared.submit_encoded(0, 4, 2, false, strips.iter().map(|(i, h, b)| (*i, *h, b.as_slice())))
+        };
+        // Not attached.
+        assert!(!try_submit(vec![(0, 1, body(0, 0, 0))]));
+        shared.open(0, small_encoded());
+        let good = (0, 1, body(0, 0, 0));
+        for bad in [
+            (4, 1, body(0, 2, 0)),           // outside the surface
+            (1, 0, body(2, 0, 0)),           // zero hash
+            (1, 1, body(0, 0, 0)),           // a body for another strip
+            (1, 1, body(2, 0, 0)[..15].to_vec()), // shorter than a strip header
+            (1, 1, { let mut b = body(2, 0, 0); b[1] = 0; b }), // not a strip
+        ] {
+            assert!(!try_submit(vec![good.clone(), bad.clone()]), "{bad:?}");
+        }
+        assert!(!shared.submit_encoded(0, 4, 3, false, [(good.0, good.1, good.2.as_slice())]));
+        assert_eq!(shared.take_encoded(0), None);
+        assert!(try_submit(vec![good.clone()]));
+        assert_eq!(shared.take_encoded(0), Some(vec![good]));
+    }
+
+    /// The producer codes everything again after an open, a gamma change, a scanout that lacked
+    /// a body, or a depth it got wrong.
+    #[test]
+    fn a_full_encode_is_requested_on_open_gamma_change_and_missing_bodies() {
+        let shared = Shared::new();
+        assert!(!shared.take_full_request(0));
+        shared.open(0, small_encoded());
+        assert!(shared.take_full_request(0));
+        assert!(!shared.take_full_request(0));
+        shared.set_gamma(0, Some(test_lut()));
+        assert!(shared.take_full_request(0));
+        // The same table again is no change.
+        shared.set_gamma(0, Some(test_lut()));
+        assert!(!shared.take_full_request(0));
+        shared.set_gamma(0, None);
+        assert!(shared.take_full_request(0));
+        shared.request_full(0);
+        assert!(shared.take_full_request(0));
+        // A gamma change still reaches the dock cursor as before.
+        assert_eq!(shared.cursor_gamma[0].lock().unwrap().0, 2);
+
+        let ridge = DockProfile::for_family(Family::Ridge).unwrap();
+        let encoder = EncoderProfile::of(ridge).unwrap();
+        shared.open(1, Accepting { encoder: Some(encoder), ..accepting(64, 16, 64, 16) });
+        assert!(shared.take_full_request(1));
+        assert_eq!(shared.encoder_profile(1), Some((encoder, 64, 16)));
+        assert!(!shared.submit_encoded(1, 64, 16, true, []));
+        assert!(shared.take_full_request(1));
+        assert!(shared.submit_encoded(1, 64, 16, false, []));
+        // Closed heads ask for nothing and describe nothing.
+        shared.close(1);
+        shared.request_full(1);
+        assert!(!shared.take_full_request(1));
+        assert_eq!(shared.encoder_profile(1), None);
+    }
+
+    /// Switching between frames and coded strips starts the mailbox over, as an open does.
+    #[test]
+    fn switching_feeds_resets_the_mailbox() {
+        let shared = Shared::new();
+        shared.open(0, small_encoded());
+        assert!(shared.take_full_request(0));
+        let mut shadow = Vec::new();
+        shared.submit_frame(0, &[1; 32], 16, 4, 2, [(0, 0, 4, 2)]);
+        assert_eq!(shared.take_frame(0, &mut shadow), Some(None));
+        shared.submit_frame(0, &[2; 32], 16, 4, 2, [(0, 0, 1, 1)]);
+
+        // Coded strips replace the pending surface damage entirely.
+        assert!(submit(&shared, &[(3, 7, 1)]));
+        assert!(shared.take_full_request(0));
+        assert!(shared.mailboxes[0].lock().unwrap().surface.is_empty());
+        assert_eq!(shared.take_encoded(0), Some(taken(&[(3, 7, 1)])));
+
+        // And a frame after coded strips is a whole new surface, with no strips left over.
+        assert!(submit(&shared, &[(2, 8, 2)]));
+        shared.submit_frame(0, &[3; 32], 16, 4, 2, []);
+        assert!(shared.take_full_request(0));
+        assert_eq!(shared.take_frame(0, &mut shadow), Some(None));
+        assert_eq!(shadow, vec![3; 24]);
+        assert!(shared.mailboxes[0].lock().unwrap().encoded.is_none());
+        // An invalid frame does not switch the feed.
+        assert!(submit(&shared, &[(2, 9, 3)]));
+        shared.submit_frame(0, &[3; 4], 16, 4, 2, []);
+        assert_eq!(shared.take_encoded(0), Some(taken(&[(2, 9, 3)])));
+    }
+
+    #[test]
+    fn gpu_time_is_reported_per_head() {
+        let shared = Shared::new();
+        shared.open(2, accepting(2, 2, 2, 2));
+        shared.add_gpu_time(2, Duration::from_micros(1500));
+        shared.add_gpu_time(9, Duration::from_micros(1));
+        assert_eq!(shared.take_stats().heads[2].unwrap().gpu_us, 1500);
     }
 
     #[test]

@@ -74,6 +74,31 @@ pub struct PresentTiming {
     pub coarse_fallback: bool,
 }
 
+/// Why [`ControlSession::present_encoded`] sent nothing. Local displaylink-lite patch 16.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PresentEncodedError {
+    /// Strip `index` was selected but holds no body coded from its current content. The session
+    /// is fine; the producer has to code every strip again.
+    MissingBody { index: usize },
+    /// Anything else, as [`ControlSession::present_rgb_dirty`] reports it.
+    Session(String),
+}
+
+impl From<String> for PresentEncodedError {
+    fn from(error: String) -> Self {
+        Self::Session(error)
+    }
+}
+
+impl core::fmt::Display for PresentEncodedError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::MissingBody { index } => write!(f, "strip {index} has no current body"),
+            Self::Session(error) => f.write_str(error),
+        }
+    }
+}
+
 /// One authenticated userspace control session.
 pub struct ControlSession {
     dock: Dock,
@@ -260,7 +285,8 @@ impl ControlSession {
             .is_some_and(crate::scanout::HeadScanout::settle)
     }
 
-    /// Stage timings of the most recent [`ControlSession::present_rgb_dirty`], on any head.
+    /// Stage timings of the most recent [`ControlSession::present_rgb_dirty`] or
+    /// [`ControlSession::present_encoded`], on any head.
     pub fn last_present(&self) -> PresentTiming {
         self.last_present
     }
@@ -606,9 +632,67 @@ impl ControlSession {
         self.last_present.coarse_fallback =
             plan != crate::scanout::Plan::Keyframe && self.scanout[head_index].last_plan_coarse();
         let encoded = self.scanout[head_index].encode(&plan, rgb, head);
-        let mut mark = Instant::now();
+        let mark = Instant::now();
         self.last_present.encode = mark - planned;
-        let Some(frame) = encoded.map_err(build_error("video frame"))? else {
+        let frame = encoded.map_err(build_error("video frame"))?;
+        self.send_planned(head, &plan, frame, mark)
+    }
+
+    /// [`ControlSession::present_rgb_dirty`] for strips a producer hashed and coded itself
+    /// (local displaylink-lite patch 16); see [`crate::scanout::HeadScanout::plan_hashed`].
+    ///
+    /// `changed` gives the new hash of every strip that may have moved since the last present,
+    /// and `bodies` the strips coded from that content; a retransmission passes neither. A
+    /// selected strip with no current body sends nothing and returns
+    /// [`PresentEncodedError::MissingBody`], which the caller answers by having every strip coded
+    /// again; the dock-visible state is left as it was.
+    pub fn present_encoded(
+        &mut self,
+        head: u8,
+        width: usize,
+        height: usize,
+        changed: &[(usize, u64)],
+        bodies: impl IntoIterator<Item = (usize, u64, Vec<u8>)>,
+    ) -> Result<usize, PresentEncodedError> {
+        let head_index = usize::from(head);
+        if head_index >= self.connectors() {
+            return Err(format!("invalid Vino head {head}").into());
+        }
+        self.last_present = PresentTiming::default();
+        let started = Instant::now();
+        let scanout = &mut self.scanout[head_index];
+        let plan = scanout.plan_hashed(width, height, changed);
+        scanout.offer_bodies(bodies);
+        let planned = Instant::now();
+        self.last_present.plan = planned - started;
+        self.last_present.coarse_fallback =
+            plan != crate::scanout::Plan::Keyframe && self.scanout[head_index].last_plan_coarse();
+        let encoded = self.scanout[head_index].encode_cached(&plan, head);
+        let mark = Instant::now();
+        self.last_present.encode = mark - planned;
+        let frame = match encoded {
+            Ok(frame) => frame,
+            Err(crate::scanout::CachedEncodeError::MissingBody { index }) => {
+                return Err(PresentEncodedError::MissingBody { index });
+            }
+            Err(crate::scanout::CachedEncodeError::Codec(error)) => {
+                return Err(build_error("video frame")(error).into());
+            }
+        };
+        Ok(self.send_planned(head, &plan, frame, mark)?)
+    }
+
+    /// Put a planned and framed picture on the wire, `presentations` times, then publish it to
+    /// the scanout and poll. `mark` is when framing finished, for the stage timings.
+    fn send_planned(
+        &mut self,
+        head: u8,
+        plan: &crate::scanout::Plan,
+        frame: Option<crate::scanout::Frame>,
+        mut mark: Instant,
+    ) -> Result<usize, String> {
+        let head_index = usize::from(head);
+        let Some(frame) = frame else {
             // Nothing moved and nothing is owed. DLM puts zero bytes on the wire here.
             self.poll_status()?;
             self.last_present.poll = mark.elapsed();
@@ -640,7 +724,7 @@ impl ControlSession {
         self.frame_seq[head_index] = sequence.wrapping_add(frame.presentations);
         // Published only now: every early return and transport error above deliberately leaves the
         // previous dock-visible state intact, so the next frame repairs it.
-        self.scanout[head_index].presented(&plan);
+        self.scanout[head_index].presented(plan);
         let polling = Instant::now();
         self.poll_status()?;
         self.last_present.poll = polling.elapsed();

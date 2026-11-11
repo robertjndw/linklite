@@ -2,6 +2,7 @@
 
 import CDLLite
 import Foundation
+import LinkLiteGPU
 
 /// A dock monitor as reported by the engine, copied out of the callback's borrowed DLLMonitor.
 struct MonitorInfo: Sendable, Equatable {
@@ -153,6 +154,41 @@ final class EngineHandle: @unchecked Sendable {
         } else {
             dll_engine_submit_frame(engine, head, bgra, stride, width, height, nil, 0)
         }
+    }
+
+    /// What a strip producer for `head` must match; nil while the head is not attached.
+    func encoderProfile(head: UInt8) -> DLLEncoderProfile? {
+        pthread_rwlock_rdlock(lock)
+        defer { pthread_rwlock_unlock(lock) }
+        guard let engine else { return nil }
+        var profile = DLLEncoderProfile()
+        return dll_engine_encoder_profile(engine, head, &profile) ? profile : nil
+    }
+
+    /// Hands the engine strips the GPU encoder coded; false when the engine refused them all.
+    func submitEncoded(head: UInt8, width: UInt32, height: UInt32, tenBit: Bool, strips: EncodedStrips) -> Bool {
+        pthread_rwlock_rdlock(lock)
+        defer { pthread_rwlock_unlock(lock) }
+        guard let engine else { return false }
+        return strips.withUnsafeBuffers { indices, hashes, bodies, offsets in
+            dll_engine_submit_encoded(engine, head, width, height, tenBit, strips.count, indices.baseAddress,
+                                      hashes.baseAddress, bodies.baseAddress, bodies.count, offsets.baseAddress)
+        }
+    }
+
+    /// Whether the engine wants every strip of `head` coded again; clears the request.
+    func takeFullRequest(head: UInt8) -> Bool {
+        pthread_rwlock_rdlock(lock)
+        defer { pthread_rwlock_unlock(lock) }
+        guard let engine else { return false }
+        return dll_engine_take_full_request(engine, head)
+    }
+
+    func addGPUTime(head: UInt8, seconds: Double) {
+        pthread_rwlock_rdlock(lock)
+        defer { pthread_rwlock_unlock(lock) }
+        guard let engine, seconds > 0 else { return }
+        dll_engine_add_gpu_time(engine, head, UInt64((seconds * 1e6).rounded()))
     }
 
     func setDisplayPower(head: UInt8, on: Bool) {

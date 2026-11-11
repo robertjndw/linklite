@@ -4,6 +4,7 @@ import CoreGraphics
 import CoreMedia
 import CoreVideo
 import Foundation
+import LinkLiteGPU
 import os
 @preconcurrency import ScreenCaptureKit
 
@@ -36,6 +37,21 @@ final class DisplayCapture: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
     private var sentFirstFrame = false
     /// Reused on the serial capture queue; the engine only borrows it during submitFrame.
     private var dirtyRects: [UInt32] = []
+    /// `defaults write com.ball.linklite GPUEncoder -bool false` codes strips on the CPU, for A/B
+    /// runs. Read when capture starts.
+    private static let gpuEncoderKey = "GPUEncoder"
+    /// `defaults write com.ball.linklite GPUPacking -bool false` keeps the GPU's transform but codes
+    /// the bits on the CPU with the engine's coder, for A/B runs.
+    private static let gpuPackingKey = "GPUPacking"
+    /// Codes this head's strips on the GPU; nil means frames go to the engine as BGRA. Set before
+    /// the stream starts, afterwards touched only on the capture queue, and dropped for the rest
+    /// of the session on the first GPU failure.
+    private var encoder: MetalStripEncoder?
+    private var encoderTenBit = false
+    /// Submissions the engine refused in a row; a few mean the encoder no longer fits the head.
+    private var refusedSubmissions = 0
+    /// Polls the engine's full-encode request while the screen is still, when no frame would.
+    private var fullRequestTimer: DispatchSourceTimer?
 
     private init(head: UInt8, width: UInt32, height: UInt32, engine: EngineHandle,
                  onStop: @escaping @Sendable (Error) -> Void) {
@@ -55,8 +71,10 @@ final class DisplayCapture: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
         let display = try await shareableDisplay(displayID)
         let capture = DisplayCapture(head: monitor.head, width: monitor.width, height: monitor.height,
                                      engine: engine, onStop: onStop)
+        capture.setUpEncoder()
         try await capture.begin(display: display, refreshHz: monitor.effectiveRefreshHz,
                                 drawsCursor: !monitor.hardwareCursor)
+        capture.queue.async { capture.startFullRequestTimer(refreshHz: monitor.effectiveRefreshHz) }
         return capture
     }
 
@@ -93,7 +111,100 @@ final class DisplayCapture: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
         log.info("Capturing display \(display.displayID) for head \(self.head) at \(self.width)x\(self.height)@\(refreshHz)")
     }
 
+    /// Before the stream starts, so no frame can race it: Metal setup happens off the main thread.
+    private func setUpEncoder() {
+        guard UserDefaults.standard.object(forKey: Self.gpuEncoderKey) as? Bool ?? true else {
+            log.info("Head \(self.head): GPU encoder turned off by the GPUEncoder default; coding on the CPU")
+            return
+        }
+        guard let profile = engine.encoderProfile(head: head) else {
+            log.info("Head \(self.head): the engine offers no strip profile; coding on the CPU")
+            return
+        }
+        do {
+            let configuration = StripEncoderConfiguration(profile: profile, width: Int(width), height: Int(height))
+            let packOnGPU = UserDefaults.standard.object(forKey: Self.gpuPackingKey) as? Bool ?? true
+            let encoder = try MetalStripEncoder(configuration: configuration, packOnGPU: packOnGPU)
+            self.encoder = encoder
+            encoderTenBit = profile.ten_bit
+            log.info("Head \(self.head): coding strips on the GPU (\(encoder.device.name, privacy: .public)), bits packed on the \(packOnGPU ? "GPU" : "CPU", privacy: .public)")
+        } catch {
+            log.error("Head \(self.head): GPU encoder unavailable, coding on the CPU: \(String(describing: error), privacy: .public)")
+        }
+    }
+
+    /// On the capture queue, once the stream runs: a stream that failed to start leaves no timer.
+    private func startFullRequestTimer(refreshHz: UInt32) {
+        guard encoder != nil, fullRequestTimer == nil else { return }
+        // Every refresh: the engine raises the request on its own (a gamma change, a missing body)
+        // and nothing else would notice while capture delivers no frames.
+        let timer = DispatchSource.makeTimerSource(queue: queue)
+        let period = DispatchTimeInterval.nanoseconds(Int(1_000_000_000 / max(refreshHz, 1)))
+        timer.schedule(deadline: .now() + period, repeating: period, leeway: period)
+        timer.setEventHandler { [weak self] in self?.serviceFullRequest() }
+        timer.resume()
+        fullRequestTimer = timer
+    }
+
+    /// The display's gamma table (768 bytes, R, G, B) for the GPU encoder; nil is the identity.
+    /// The engine applies it itself to BGRA frames, so the CPU path needs nothing here.
+    func setGamma(_ lut: [UInt8]?) {
+        queue.async { [weak self] in self?.encoder?.setGamma(lut) }
+    }
+
+    private func serviceFullRequest() {
+        guard let encoder else { return }
+        if engine.takeFullRequest(head: head) {
+            encoder.requestFullEncode()
+        }
+        guard encoder.needsFullEncode, encoder.hasFrame else { return }
+        do {
+            if let strips = try encoder.encodeFromShadow() {
+                try submit(strips)
+            }
+        } catch {
+            dropEncoder(error, resubmitShadow: true)
+        }
+    }
+
+    private func submit(_ strips: EncodedStrips) throws {
+        engine.addGPUTime(head: head, seconds: strips.gpuSeconds)
+        if engine.submitEncoded(head: head, width: width, height: height, tenBit: encoderTenBit, strips: strips) {
+            refusedSubmissions = 0
+            return
+        }
+        // The GPU already counts these strips as sent, so only a full encode can resync it.
+        encoder?.requestFullEncode()
+        refusedSubmissions += 1
+        if refusedSubmissions >= 3 {
+            throw MetalStripEncoderError.gpu("the engine refused \(refusedSubmissions) submissions in a row")
+        }
+    }
+
+    /// With `resubmitShadow`, also hands the engine the last frame the GPU saw, as BGRA. Without
+    /// it a still screen would leave the engine's CPU feed with no surface at all until the next
+    /// capture frame, which may never come; the frame callback passes false because it submits
+    /// its own frame right after.
+    private func dropEncoder(_ error: Error, resubmitShadow: Bool = false) {
+        log.error("Head \(self.head): GPU encoder failed, coding on the CPU for the rest of the session: \(String(describing: error), privacy: .public)")
+        let last = resubmitShadow ? encoder?.shadowBGRA() : nil
+        encoder = nil
+        fullRequestTimer?.cancel()
+        fullRequestTimer = nil
+        guard let last else { return }
+        // Possibly a mix of two frames if the GPU died mid-copy. The next capture frame replaces it.
+        last.withUnsafeBufferPointer { bgra in
+            engine.submitFrame(head: head, bgra: bgra.baseAddress!, stride: Int(width) * 4, width: width, height: height,
+                               dirty: nil)
+        }
+        sentFirstFrame = true
+    }
+
     func stop() async {
+        queue.async { [weak self] in
+            self?.fullRequestTimer?.cancel()
+            self?.fullRequestTimer = nil
+        }
         guard let stream else { return }
         do {
             try await stream.stopCapture()
@@ -140,6 +251,27 @@ final class DisplayCapture: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
                 dirtyRects.append(UInt32(rect.height))
             }
             dirty = dirtyRects
+        }
+
+        if let encoder {
+            do {
+                if engine.takeFullRequest(head: head) {
+                    encoder.requestFullEncode()
+                }
+                // The encoder waits for its command buffer, so the sample buffer, which owns the
+                // IOSurface the GPU reads, outlives every use of it.
+                let strips = try withExtendedLifetime(sampleBuffer) {
+                    try encoder.encode(frame: pixelBuffer, dirty: dirty)
+                }
+                try submit(strips)
+                sentFirstFrame = true
+                return
+            } catch {
+                // The engine starts its mailbox over when the BGRA frame below arrives, so that
+                // frame has to be whole: its dirty rects only describe the change since the last.
+                dropEncoder(error)
+                dirty = nil
+            }
         }
 
         guard CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly) == kCVReturnSuccess else { return }

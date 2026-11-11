@@ -124,6 +124,7 @@ final class DisplayHost {
             let usb = perPresent(head.usb_us)
             let poll = perPresent(head.poll_us)
             let submit = Double(head.submit_us) / 1000 / Double(max(head.frames_submitted, 1))
+            let gpu = Double(head.gpu_us) / 1000 / Double(max(head.frames_submitted, 1))
             perfLog.info("""
                 head \(head.head, privacy: .public): \
                 \(fps, format: .fixed(precision: 1), privacy: .public) fps in, \
@@ -138,7 +139,8 @@ final class DisplayHost {
                 pack \(pack, format: .fixed(precision: 2), privacy: .public) \
                 usb \(usb, format: .fixed(precision: 2), privacy: .public) \
                 poll \(poll, format: .fixed(precision: 2), privacy: .public); \
-                ms/frame submit \(submit, format: .fixed(precision: 2), privacy: .public); \
+                ms/frame submit \(submit, format: .fixed(precision: 2), privacy: .public) \
+                gpu \(gpu, format: .fixed(precision: 2), privacy: .public); \
                 engine \(passesPerSecond, format: .fixed(precision: 0), privacy: .public) passes/s, \
                 budget wait \(budgetWaitPerSecond, format: .fixed(precision: 1), privacy: .public) ms/s
                 """)
@@ -223,6 +225,9 @@ final class DisplayHost {
             guard let display = state.display, let lut = Self.gammaTable(of: display.displayID),
                   lut != state.sentGamma else { continue }
             heads[head]?.sentGamma = lut
+            // The GPU encoder applies the table itself; it gets it first so the full encode the
+            // engine then asks for already uses it.
+            state.capture?.setGamma(lut)
             engine.setGamma(head: head, lut: lut)
         }
     }
@@ -354,6 +359,8 @@ final class DisplayHost {
                     return
                 }
                 self.heads[head]?.capture = capture
+                // A table read while the stream was starting went to the engine only.
+                capture.setGamma(self.heads[head]?.sentGamma)
                 self.heads[head]?.startTask = nil
                 if self.heads[head]?.retryAttempt ?? 0 > 0 {
                     log.info("Capture for head \(head) restarted")

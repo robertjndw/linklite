@@ -137,6 +137,86 @@ The packing comparison exercised the former double-copy path and the borrowed-bo
 
 Capture smoke checks exercised initial/full, partial, empty, and scaled damage through the actual Swift callback. Cursor checks compared reused-buffer output byte-for-byte and checked hotspots at 1× and 2×. No full-application RSS reduction, USB throughput gain, eight-hour stability result, hotplug result, or older-macOS compatibility result is claimed by these checks.
 
+## Offline replay benchmark
+
+`replay` measures the CPU cost of the pixel path with no dock and no Screen Recording permission, so it runs while DisplayLink Manager keeps the dock. It feeds recorded frames through `Shared::submit_frame`, the engine's `take_frame`, then `HeadScanout::plan_dirty` and `encode` from the vendored codec, and packs the records into 64 KiB transfers that go to a null sink instead of USB. It runs once per dock profile (Ridge, Ella, Navarro).
+
+### Clip format
+
+A clip is a directory:
+
+| File | Contents |
+|---|---|
+| `meta.json` | `{"width": 3840, "height": 2160, "stride": 15360, "frames": 300, "fps": 60}`, flat, numbers only. `stride` is bytes per row. |
+| `NNNNN.bgra` | Frame `NNNNN` (zero-padded to five digits, from `00000`) as raw 32-bit BGRA, exactly `stride * height` bytes. If the file is absent the frame repeats the previous image (`00000.bgra` must exist). |
+| `NNNNN.dirty` | Optional damage for the frame: packed little-endian `u32` quads `x, y, w, h`, in pixels. An absent file means a full frame, an empty file means nothing changed. |
+
+Clips are large (a 4K frame is 33 MB) and live outside the repository. Replay loads a whole clip into memory, so a 300-frame 4K clip needs about 10 GB of RAM.
+
+### Making clips
+
+Synthetic clips are deterministic, so baseline and later runs see identical pixels:
+
+```sh
+cargo build --release --locked --manifest-path engine/Cargo.toml
+R=engine/target/release/replay
+$R gen motion      clips/motion      # 1600x900 window of the motion.html workload on a 4K desktop
+$R gen motion-full clips/motion-full # the same workload over the whole 4K surface
+$R gen idle        clips/idle        # a clock-sized region that changes once per 60 frames
+$R gen-gamma       clips/gamma.lut   # a non-identity 768-byte table (R, G, B, 256 bytes each)
+```
+
+`gen` takes `--frames N` (default 300). The dirty rect of each frame is the exact bounding box of the pixels that changed since the previous frame.
+
+To record a real desktop instead, run motion.html in Chrome and capture it (grant Screen Recording to the terminal first):
+
+```sh
+swift run linklite-bench record clips/real-motion --display main --frames 300
+```
+
+It captures the way `DisplayCapture` does (32BGRA, sRGB, queue depth 3, damage only while the stream is 1:1 with the display, first frame whole) and does not link the engine. ScreenCaptureKit delivers frames only when something changed, so an idle desktop gives a shorter clip than its wall-clock length, and `meta.json` records the delivered count.
+
+### Running it
+
+```sh
+$R run clips/motion clips/motion-full clips/idle --family all --runs 3 \
+  --gamma none --gamma clips/gamma.lut --out docs/benchmark/gpu-baseline-2026-11-11.json
+python3 docs/benchmark/summarize-gpu.py docs/benchmark/gpu-baseline-2026-11-11.json other.json
+```
+
+`--family` is `ridge`, `ella`, `navarro` or `all`. `--gamma` may repeat; `none` is the identity path, a file is applied through the engine's gamma copy (an identity table is rejected, because it would silently skip that path). Each combination of clip, gamma and family runs `--runs` times and reports the run with the median mean CPU; the other runs' means are in `run_cpu_means`. All runs must produce the same checksum or replay fails.
+
+Per entry:
+
+- `cpu_ms_per_frame`: `getrusage` user plus system CPU of the whole process, including the worker pool, around each frame's pipeline (file loading and checksumming excluded): mean, p50, p95.
+- `wall_ms_per_frame` and `wall_ms_total`: the same window in wall time, the per-frame latency of the pipeline.
+- `stage_ms_per_frame`: wall time per stage, averaged over all frames (frames that do not present count as zero for plan, encode and pack). Stages that run on the worker pool overlap, so these do not add up to the CPU figure.
+- `record_bytes`: EP08 record bytes in order; `sent_bytes`: what packing would put on USB (records times presentations, plus openers and trailers); `presents` and `skipped`.
+- `checksum`: FNV-1a over every present's presentation count and records, each length-prefixed, in order. The same clip and the same code give the same checksum, so a GPU path that is byte-equal to the CPU path matches the baseline.
+
+### The GPU encoder path
+
+`linklite-bench replay` drives the same engine path through the engine's C bench API (`dll_bench_*` in `engine/include/dllite.h`, a thin wrapper over the Rust `Replay`), fed either way:
+
+```sh
+swift build -c release --product linklite-bench
+B=$(swift build -c release --show-bin-path)/linklite-bench
+$B replay clips/motion clips/motion-full clips/idle --cpu --family all --runs 3 --gamma none --gamma clips/gamma.lut
+$B replay clips/motion clips/motion-full clips/idle --gpu --family all --runs 3 --gamma none --gamma clips/gamma.lut \
+  --out docs/benchmark/gpu-phase2-2026-11-11.json
+python3 docs/benchmark/summarize-gpu.py docs/benchmark/gpu-baseline-2026-11-11.json \
+  docs/benchmark/gpu-phase1-2026-11-11.json docs/benchmark/gpu-phase2-2026-11-11.json
+```
+
+`--cpu` feeds BGRA frames through `dll_engine_submit_frame`'s path and must reproduce `replay run`'s checksums. `--gpu` copies each frame into an IOSurface-backed `CVPixelBuffer` (outside the measured window, since ScreenCaptureKit hands over IOSurfaces) and codes it with `MetalStripEncoder`: hashing, the shadow copy, gamma, the transform, quantisation and the bit coding all on the GPU, after which the strips go straight from the encoder's shared buffers through `dll_engine_submit_encoded`'s path. `--gpu --cpu-pack` is the Phase 1 path: the GPU stops at the quantised blocks and the CPU codes them through `dll_encode_strip_quantized`. The checksum must equal the CPU path's for every clip, family and gamma. The JSON adds `gpu_ms_per_frame` (command buffer `gpuEndTime - gpuStartTime`), a `gpu_encoder` stage (the encoder's wall time: GPU wait, plus CPU packing with `--cpu-pack`), `packing`, and `gpu_memory_bytes` (what the encoder held at the end of the largest run, its body buffer at its high-water mark). `cpu_ms_per_frame` counts the whole process, so with `--cpu-pack` it includes the packing threads.
+
+### What is simplified
+
+- The 100 MB/s video budget uses the engine's constants and token rules on a virtual clock that advances one frame period per frame. A wall clock would make which frames get held back, and so the checksum, depend on replay speed. Replay itself runs as fast as it can, not at the original pacing. Settling and owed repaints follow the same virtual clock.
+- One engine pass per frame: submit, then take and present if the budget allows. The synthetic motion clips stay under the budget (about 90 MB over five seconds), so `skipped` is 0; a recorded full-screen video clip is what exercises it.
+- The stream report that is sealed with the session's key is not in the packed bytes (there is no session). The checksum covers the records only.
+- The CPU figure is whole-process, so it includes the worker pool's threads and anything else the process does during the frame.
+
 ## README graphics
 
 The lead graphic uses the saved historical LinkLite 0.2.0 real-dock results in [`benchmark/results.json`](benchmark/results.json), not the v0.3.7 component checks. The memory headline compares each driver's mean memory across desktop and animation: `100 × (1 − 134.0549 / 512.8444) = 73.86%`, rounded to **74% less memory**. The supporting whole-GPU-busy figure under motion is `100 × (1 − 15.2308 / 32.9556) = 53.78%`, rounded to **54% lower**. Neither is a new measurement of v0.3.7.

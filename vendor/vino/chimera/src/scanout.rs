@@ -47,6 +47,33 @@ pub struct Frame {
     pub presentations: u32,
 }
 
+/// Why [`HeadScanout::encode_cached`] could not frame a plan.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CachedEncodeError {
+    /// Strip `index` is selected but holds no body coded from its current content. Recoverable:
+    /// the producer codes it again and the next plan goes out.
+    MissingBody { index: usize },
+    /// The codec or record framing failed.
+    Codec(crate::kshim::Error),
+}
+
+impl From<crate::kshim::Error> for CachedEncodeError {
+    fn from(error: crate::kshim::Error) -> Self {
+        Self::Codec(error)
+    }
+}
+
+impl core::fmt::Display for CachedEncodeError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::MissingBody { index } => write!(f, "strip {index} has no current body"),
+            Self::Codec(error) => error.fmt(f),
+        }
+    }
+}
+
+impl std::error::Error for CachedEncodeError {}
+
 /// Per-head content shadow and retransmit ledger.
 pub struct HeadScanout {
     /// The dock being fed: it states the strip size and how a change is spread over its buffers.
@@ -148,10 +175,40 @@ impl HeadScanout {
         rgb: &[u8],
         dirty: Option<&[(usize, usize, usize, usize)]>,
     ) -> Plan {
+        let (strip_w, strip_h) = self.reshape(w_pad, h_pad);
+        self.pending = match dirty {
+            Some(rects) if !self.keyframe_owed => {
+                strip_hashes_within(rgb, w_pad, h_pad, strip_w, strip_h, &self.hashes, rects)
+            }
+            _ => strip_hashes(rgb, w_pad, h_pad, strip_w, strip_h),
+        };
+        self.plan_pending()
+    }
+
+    /// [`HeadScanout::plan_dirty`] for a producer that hashes strips itself (local displaylink-lite
+    /// patch 16): `changed` gives `(strip index, hash)` for every strip whose content may have
+    /// moved since the last planned surface, and every other strip keeps its last hash. Indices
+    /// are raster order over `w_pad / strip_w` strips per row; ones outside the surface are
+    /// ignored. Hashes must never be 0, which marks a strip whose content is unknown.
+    ///
+    /// Call [`HeadScanout::offer_bodies`] after this, not before: a new surface size discards
+    /// every cached body here.
+    pub fn plan_hashed(&mut self, w_pad: usize, h_pad: usize, changed: &[(usize, u64)]) -> Plan {
+        self.reshape(w_pad, h_pad);
+        let mut pending = self.hashes.clone();
+        for &(index, hash) in changed {
+            if let Some(slot) = pending.get_mut(index) {
+                *slot = hash;
+            }
+        }
+        self.pending = pending;
+        self.plan_pending()
+    }
+
+    /// Size the per-strip state for a `w_pad` x `h_pad` surface; returns the strip size.
+    fn reshape(&mut self, w_pad: usize, h_pad: usize) -> (usize, usize) {
         let (strip_w, strip_h) = self.dock.strip_dims();
-        let tiles_x = w_pad / strip_w;
-        let tiles_y = h_pad / strip_h;
-        let expected = tiles_x * tiles_y;
+        let expected = (w_pad / strip_w) * (h_pad / strip_h);
 
         // A surface of a different size says nothing about the one the dock is holding.
         if self.w_pad != w_pad || self.h_pad != h_pad || self.hashes.len() != expected {
@@ -164,13 +221,15 @@ impl HeadScanout {
             self.touched = vec![false; expected];
             self.keyframe_owed = true;
         }
+        (strip_w, strip_h)
+    }
 
-        self.pending = match dirty {
-            Some(rects) if !self.keyframe_owed => {
-                strip_hashes_within(rgb, w_pad, h_pad, strip_w, strip_h, &self.hashes, rects)
-            }
-            _ => strip_hashes(rgb, w_pad, h_pad, strip_w, strip_h),
-        };
+    /// The plan for `pending`, the hashes of the surface being planned. Shared by both ways of
+    /// hashing it, so the ledger cannot be kept two different ways.
+    fn plan_pending(&mut self) -> Plan {
+        let (strip_w, strip_h) = self.dock.strip_dims();
+        let tiles_x = self.w_pad / strip_w;
+        let tiles_y = self.h_pad / strip_h;
         if self.keyframe_owed {
             return Plan::Keyframe;
         }
@@ -195,6 +254,19 @@ impl HeadScanout {
         if rects.is_empty() { Plan::Idle } else { Plan::Damage(rects) }
     }
 
+    /// Cache strip bodies a producer coded itself, each with the hash of the content it was
+    /// coded from (local displaylink-lite patch 16). A body is served only while that hash is
+    /// still the strip's current one, exactly like a body [`HeadScanout::encode`] made. Indices
+    /// outside the surface are ignored.
+    pub fn offer_bodies(&mut self, bodies: impl IntoIterator<Item = (usize, u64, Vec<u8>)>) {
+        for (index, hash, body) in bodies {
+            if index < self.bodies.len() {
+                self.bodies[index] = Some(body);
+                self.body_hashes[index] = hash;
+            }
+        }
+    }
+
     /// Encode the strips `plan` selects into EP08 records, reusing bodies that are still current.
     ///
     /// `rgb` must be the surface [`HeadScanout::plan`] was called with. Returns `None` when the
@@ -205,8 +277,52 @@ impl HeadScanout {
         rgb: &[u8],
         head: u8,
     ) -> Result<Option<Frame>, crate::kshim::Error> {
-        let (strip_w, strip_h) = self.dock.strip_dims();
-        let tiles_x = self.w_pad / strip_w;
+        let Some((coords, presentations)) = self.selection(plan)? else {
+            return Ok(None);
+        };
+
+        // Strips without a current cached body are encoded across cores: each strip's body
+        // depends only on its own pixels, and a 4K keyframe is 8100 of them.
+        let mut fresh: Vec<(usize, usize, usize, Option<Result<Vec<u8>, crate::kshim::Error>>)> =
+            Vec::new();
+        for &(sx, sy) in &coords {
+            let index = self.strip_index(sx, sy);
+            if !self.body_current(index) {
+                fresh.push((index, sx, sy, None));
+            }
+        }
+        let (dock, w_pad) = (self.dock, self.w_pad);
+        par_for_each_mut(&mut fresh, crate::pool::threads(), |_, (_, sx, sy, body)| {
+            *body = Some(kvino::encode_strip(dock, w_pad, rgb, *sx, *sy));
+        });
+        for (index, _, _, body) in fresh {
+            self.bodies[index] = Some(body.expect("every fresh strip was encoded")?);
+            self.body_hashes[index] = self.pending[index];
+        }
+        Ok(Some(self.frame(&coords, presentations, head)?))
+    }
+
+    /// [`HeadScanout::encode`] with no surface to encode from (local displaylink-lite patch 16):
+    /// every strip `plan` selects must already hold a current body, from an earlier encode or
+    /// from [`HeadScanout::offer_bodies`]. When one does not, nothing is framed and the error
+    /// names it; the producer has to code the strip again before this plan can go out.
+    pub fn encode_cached(&self, plan: &Plan, head: u8) -> Result<Option<Frame>, CachedEncodeError> {
+        let Some((coords, presentations)) = self.selection(plan)? else {
+            return Ok(None);
+        };
+        if let Some(index) = coords
+            .iter()
+            .map(|&(sx, sy)| self.strip_index(sx, sy))
+            .find(|&index| !self.body_current(index))
+        {
+            return Err(CachedEncodeError::MissingBody { index });
+        }
+        Ok(Some(self.frame(&coords, presentations, head)?))
+    }
+
+    /// The strips `plan` selects, raster ordered, and how many times to present them; `None`
+    /// when nothing at all goes on the wire.
+    fn selection(&self, plan: &Plan) -> Result<Option<(Vec<(usize, usize)>, u32)>, crate::kshim::Error> {
         let (coords, presentations) = match plan {
             Plan::Idle => return Ok(None),
             Plan::Damage(clips) => (
@@ -224,39 +340,29 @@ impl HeadScanout {
                 self.dock.keyframe_presentations(),
             ),
         };
-        if coords.is_empty() {
-            return Ok(None);
-        }
+        Ok((!coords.is_empty()).then_some((coords, presentations)))
+    }
 
-        // Strips without a current cached body are encoded across cores: each strip's body
-        // depends only on its own pixels, and a 4K keyframe is 8100 of them.
-        let mut fresh: Vec<(usize, usize, usize, Option<Result<Vec<u8>, crate::kshim::Error>>)> =
-            Vec::new();
-        for &(sx, sy) in &coords {
-            let index = (sy / strip_h) * tiles_x + (sx / strip_w);
-            let current = self.pending[index];
-            if self.bodies[index].is_none() || self.body_hashes[index] != current {
-                fresh.push((index, sx, sy, None));
-            }
-        }
-        let (dock, w_pad) = (self.dock, self.w_pad);
-        par_for_each_mut(&mut fresh, crate::pool::threads(), |_, (_, sx, sy, body)| {
-            *body = Some(kvino::encode_strip(dock, w_pad, rgb, *sx, *sy));
-        });
-        for (index, _, _, body) in fresh {
-            self.bodies[index] = Some(body.expect("every fresh strip was encoded")?);
-            self.body_hashes[index] = self.pending[index];
-        }
+    fn strip_index(&self, sx: usize, sy: usize) -> usize {
+        let (strip_w, strip_h) = self.dock.strip_dims();
+        (sy / strip_h) * (self.w_pad / strip_w) + (sx / strip_w)
+    }
 
+    /// Whether strip `index` has a cached body coded from its content as of the last plan.
+    fn body_current(&self, index: usize) -> bool {
+        self.bodies[index].is_some() && self.body_hashes[index] == self.pending[index]
+    }
+
+    /// Frame the cached bodies of `coords`, every one of which must be current.
+    fn frame(&self, coords: &[(usize, usize)], presentations: u32, head: u8) -> Result<Frame, crate::kshim::Error> {
         let mut strips: Vec<&[u8]> = Vec::with_capacity(coords.len());
-        for &(sx, sy) in &coords {
-            let index = (sy / strip_h) * tiles_x + (sx / strip_w);
-            strips.push(self.bodies[index].as_deref().expect("body cached above"));
+        for &(sx, sy) in coords {
+            strips.push(self.bodies[self.strip_index(sx, sy)].as_deref().expect("body cached above"));
         }
-        Ok(Some(Frame {
+        Ok(Frame {
             records: kvino::frame_records(self.dock, &strips, head)?,
             presentations,
-        }))
+        })
     }
 
     /// Record that `plan`'s frame reached the dock.
@@ -712,6 +818,154 @@ mod tests {
                 assert_ne!(base, hash(&[&flipped, &b]), "len {len} byte {i}");
             }
         }
+    }
+
+    /// A producer that hashes and codes strips itself, as the GPU encoder does, using the
+    /// scanout's own strip hashes so its plans can be compared with `plan_dirty`'s.
+    struct Producer {
+        dock: kvino::DockProfile,
+        seen: Vec<u64>,
+    }
+
+    impl Producer {
+        /// The strips whose hash moved since the last call (every strip when `full`), and a
+        /// body for each.
+        #[allow(clippy::type_complexity)]
+        fn produce(&mut self, w: usize, h: usize, rgb: &[u8], full: bool) -> (Vec<(usize, u64)>, Vec<(usize, u64, Vec<u8>)>) {
+            let (strip_w, strip_h) = self.dock.strip_dims();
+            let hashes = strip_hashes(rgb, w, h, strip_w, strip_h);
+            let full = full || self.seen.len() != hashes.len();
+            let tiles_x = w / strip_w;
+            let mut changed = Vec::new();
+            let mut bodies = Vec::new();
+            for (i, &hash) in hashes.iter().enumerate() {
+                if full || self.seen[i] != hash {
+                    let (sx, sy) = ((i % tiles_x) * strip_w, (i / tiles_x) * strip_h);
+                    changed.push((i, hash));
+                    bodies.push((i, hash, kvino::encode_strip(self.dock, w, rgb, sx, sy).unwrap()));
+                }
+            }
+            self.seen = hashes;
+            (changed, bodies)
+        }
+    }
+
+    /// Local displaylink-lite patch 16: hashes and bodies supplied by a producer plan and frame
+    /// exactly what hashing and encoding the surface here does, through damage, retransmit debt,
+    /// a settle, a keyframe and a new surface size.
+    #[test]
+    fn supplied_hashes_and_bodies_put_the_same_records_on_the_wire() {
+        for family in [kvino::Family::Ella, kvino::Family::Ridge, kvino::Family::Navarro] {
+            for deep in [false, true] {
+                let mut dock = kvino::DockProfile::for_family(family).unwrap();
+                if deep {
+                    dock = dock.ten_bit();
+                }
+                let (strip_w, strip_h) = dock.strip_dims();
+                let mut cpu = HeadScanout::new(dock);
+                let mut gpu = HeadScanout::new(dock);
+                let mut producer = Producer { dock, seen: Vec::new() };
+                let (mut w, mut h) = (512, 64);
+                let mut frames = 0;
+                // One present on both sides. `dirty: None` means a new surface; `Some` is the
+                // hint the CPU side gets, and the producer finds the same change by hashing.
+                let mut step = |cpu: &mut HeadScanout,
+                                gpu: &mut HeadScanout,
+                                producer: &mut Producer,
+                                w: usize,
+                                h: usize,
+                                rgb: &[u8],
+                                dirty: Option<&[(usize, usize, usize, usize)]>| {
+                    let want = cpu.plan_dirty(w, h, rgb, dirty);
+                    let (changed, bodies) = producer.produce(w, h, rgb, false);
+                    let got = gpu.plan_hashed(w, h, &changed);
+                    gpu.offer_bodies(bodies);
+                    assert_eq!(got, want, "{} frame {frames}", dock.name());
+                    let want_frame = cpu.encode(&want, rgb, 0).unwrap();
+                    let got_frame = gpu.encode_cached(&got, 0).unwrap();
+                    match (want_frame, got_frame) {
+                        (None, None) => {}
+                        (Some(a), Some(b)) => {
+                            assert_eq!(a.records, b.records, "{} frame {frames}", dock.name());
+                            assert_eq!(a.presentations, b.presentations);
+                        }
+                        _ => panic!("{} frame {frames}: one side framed nothing", dock.name()),
+                    }
+                    cpu.presented(&want);
+                    gpu.presented(&got);
+                    frames += 1;
+                    want
+                };
+                let paint = |rgb: &mut [u8], w: usize, x0: usize, y0: usize, x1: usize, y1: usize, seed: u8| {
+                    for y in y0..y1 {
+                        for x in x0..x1 {
+                            let at = (y * w + x) * 3;
+                            rgb[at..at + 3].copy_from_slice(&[seed ^ x as u8, seed.wrapping_add(y as u8), seed]);
+                        }
+                    }
+                };
+
+                let mut rgb = vec![0x20u8; w * h * 3];
+                assert_eq!(step(&mut cpu, &mut gpu, &mut producer, w, h, &rgb, None), Plan::Keyframe);
+                // Damage in two places, then retransmissions of it with nothing new.
+                paint(&mut rgb, w, 3, 2, 70, 9, 0x91);
+                paint(&mut rgb, w, 300, 40, 301, 41, 0x13);
+                let hint = [(3, 2, 70, 9), (300, 40, 301, 41)];
+                assert!(matches!(step(&mut cpu, &mut gpu, &mut producer, w, h, &rgb, Some(&hint)), Plan::Damage(_)));
+                // A change while the first still owes copies, so debts overlap.
+                paint(&mut rgb, w, 0, strip_h, strip_w, 2 * strip_h, 0x44);
+                step(&mut cpu, &mut gpu, &mut producer, w, h, &rgb, Some(&[(0, strip_h, strip_w, 2 * strip_h)]));
+                while step(&mut cpu, &mut gpu, &mut producer, w, h, &rgb, Some(&[])) != Plan::Idle {}
+                // Settle re-owes everything touched since the last settle.
+                assert_eq!(cpu.settle(), gpu.settle());
+                while step(&mut cpu, &mut gpu, &mut producer, w, h, &rgb, Some(&[])) != Plan::Idle {}
+                // A keyframe owed with no change is served from cached bodies alone.
+                cpu.owe_keyframe();
+                gpu.owe_keyframe();
+                assert_eq!(step(&mut cpu, &mut gpu, &mut producer, w, h, &rgb, Some(&[])), Plan::Keyframe);
+                // Repainting a strip with what it already holds sends nothing.
+                assert_eq!(step(&mut cpu, &mut gpu, &mut producer, w, h, &rgb, Some(&[(0, 0, w, h)])), Plan::Idle);
+                // A new surface size starts over with a keyframe.
+                (w, h) = (w + strip_w, h + strip_h);
+                let mut rgb = vec![0x50u8; w * h * 3];
+                assert_eq!(step(&mut cpu, &mut gpu, &mut producer, w, h, &rgb, None), Plan::Keyframe);
+                paint(&mut rgb, w, w - 5, h - 5, w, h, 0x77);
+                step(&mut cpu, &mut gpu, &mut producer, w, h, &rgb, None);
+                while step(&mut cpu, &mut gpu, &mut producer, w, h, &rgb, Some(&[])) != Plan::Idle {}
+            }
+        }
+    }
+
+    /// Local displaylink-lite patch 16: a selected strip with no body for its current hash is a
+    /// distinct error naming the strip, and the plan goes out once the body arrives.
+    #[test]
+    fn a_strip_without_a_current_body_is_named_not_framed() {
+        let dock = ridge();
+        let mut head = HeadScanout::new(dock);
+        let mut producer = Producer { dock, seen: Vec::new() };
+        let mut rgb = surface(128, 32, 0x20);
+        let (changed, bodies) = producer.produce(128, 32, &rgb, true);
+        // Every hash but no bodies: the keyframe cannot be framed.
+        let plan = head.plan_hashed(128, 32, &changed);
+        assert_eq!(plan, Plan::Keyframe);
+        assert_eq!(head.encode_cached(&plan, 0).err(), Some(CachedEncodeError::MissingBody { index: 0 }));
+        head.offer_bodies(bodies);
+        assert!(head.encode_cached(&plan, 0).unwrap().is_some());
+        head.presented(&plan);
+
+        // A body coded from older content than the strip's current hash is not served.
+        rgb[(16 * 128 + 70) * 3] = 0xff;
+        let (changed, bodies) = producer.produce(128, 32, &rgb, false);
+        assert_eq!(changed.len(), 1);
+        let stale: Vec<_> = bodies.iter().map(|(i, _, body)| (*i, changed[0].1 ^ 2, body.clone())).collect();
+        let plan = head.plan_hashed(128, 32, &changed);
+        head.offer_bodies(stale);
+        assert_eq!(head.encode_cached(&plan, 0).err(), Some(CachedEncodeError::MissingBody { index: 3 }));
+        head.offer_bodies(bodies);
+        assert!(head.encode_cached(&plan, 0).unwrap().is_some());
+        // Out-of-range strips are ignored rather than trusted.
+        head.offer_bodies([(99, 1, vec![1])]);
+        assert_eq!(head.plan_hashed(128, 32, &[(99, 5)]), plan);
     }
 
     #[test]

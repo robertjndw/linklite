@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 fn main() {
     let a: Vec<usize> = std::env::args().skip(1).map(|s| s.parse().unwrap()).collect();
     let (w, h, hz, secs) = (a[0], a[1], a[2] as u32, a[3] as u64);
-    let mut s = vino_chimera::session::ControlSession::engage().expect("engage");
+    let mut s = dlcore::session::ControlSession::engage().expect("engage");
     let colours = [[0u8, 80, 255], [255, 40, 40]];
     let mut lit = Vec::new();
     for output in 0..s.output_count() as u8 {

@@ -18,7 +18,7 @@ Before running a build, quit DisplayLink Manager: only one program can drive the
 The project is split into:
 
 - **`engine/`**: the dock engine in Rust. USB transport, HDCP 2.2 authentication, encrypted control plane, mode setting, video codec, hardware cursor, and rate limiting, exposed through a C ABI in `engine/include/dllite.h`. libusb is built from source and linked statically.
-- **`vendor/vino/`**: the vendored Vino/chimera userspace DL3 protocol core (GPL-2.0-or-later). See [Changing `vendor/vino/`](#changing-vendorvino).
+- **`vendor/dlcore/`**: the DL3 protocol core (crates `dlcore`, `dlcore-usb`, `kernel-shim`), derived from Vino and maintained here as its own fork (GPL-2.0-or-later). See [Changing `vendor/dlcore/`](#changing-vendordlcore).
 - **`vendor/libusb1-sys/`**: the pinned libusb bindings and statically linked native library, with descriptor-parser safety backports. Provenance and refresh requirements are in its [README](vendor/libusb1-sys/README.md).
 - **`Sources/LinkLite/`**: the Swift menu-bar app. Virtual displays, screen capture, pointer tracking, display sleep/wake.
 - **`Sources/CDLLite/`**: the C module that exposes the engine's C ABI and the private CoreGraphics virtual-display classes to Swift.
@@ -64,10 +64,10 @@ scripts/test-usb-descriptors.sh
 cargo test --locked --manifest-path engine/Cargo.toml
 
 # Vendored protocol core (builds through engine/, since its optional Linux dependency is not vendored)
-(cd engine && cargo test --locked -p vino-chimera)
+(cd engine && cargo test --locked -p dlcore)
 
 # USB transport queue bounds and cancellation ownership
-(cd engine && cargo test --locked -p vino-driver)
+(cd engine && cargo test --locked -p dlcore-usb)
 
 # Swift package: build/sign the application first, then exercise the Swift package
 scripts/build-app.sh
@@ -90,9 +90,9 @@ Logs go to the unified log under the subsystem `com.ball.linklite`:
 log stream --predicate 'subsystem == "com.ball.linklite"' --level info
 ```
 
-## Changing `vendor/vino/`
+## Changing `vendor/dlcore/`
 
-`vendor/vino/` is a copy of upstream [Vino](https://github.com/cameron1729/Vino) `revdi/` at a pinned commit. Every local change to it must be recorded in [`vendor/vino/UPSTREAM.md`](vendor/vino/UPSTREAM.md): which files and functions changed, why, and what was measured. Keep the per-file `SPDX-License-Identifier` headers intact. Changes that are not specific to macOS are worth offering upstream as well.
+`vendor/dlcore/` was derived from upstream [Vino](https://github.com/cameron1729/Vino) `revdi/` at a pinned commit and is now maintained as its own fork. Every change to it must be recorded in [`vendor/dlcore/ORIGIN.md`](vendor/dlcore/ORIGIN.md): which files and functions changed, why, and what was measured. Keep the per-file `SPDX-License-Identifier` headers intact.
 
 ## Reporting dock compatibility
 

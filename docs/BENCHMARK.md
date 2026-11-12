@@ -133,7 +133,7 @@ These are local, narrowly scoped, hardware-free measurements of the engineering 
 
 The panel measurement launched the production SwiftUI panel and controller in a temporary native host, showed it, dismissed it, waited one second for the fade to finish, then sampled process CPU time with `getrusage`. Both versions used the same searching state. Releasing the hidden view tree stops its repeating status animation. This measures panel overhead, not the USB engine or an attached-display workload.
 
-The packing comparison exercised the former double-copy path and the borrowed-body path against the same patterned RGB frame and cached encoded strips. The new path avoids 16,200 strip-body allocations and 41,988,360 copied body bytes per such full frame; this is allocation/copy traffic, not retained memory. The byte-equivalence regression remains in `vendor/vino`; the temporary timing harness was removed.
+The packing comparison exercised the former double-copy path and the borrowed-body path against the same patterned RGB frame and cached encoded strips. The new path avoids 16,200 strip-body allocations and 41,988,360 copied body bytes per such full frame; this is allocation/copy traffic, not retained memory. The byte-equivalence regression remains in `vendor/dlcore`; the temporary timing harness was removed.
 
 Capture smoke checks exercised initial/full, partial, empty, and scaled damage through the actual Swift callback. Cursor checks compared reused-buffer output byte-for-byte and checked hotspots at 1× and 2×. No full-application RSS reduction, USB throughput gain, eight-hour stability result, hotplug result, or older-macOS compatibility result is claimed by these checks.
 

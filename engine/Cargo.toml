@@ -5,11 +5,16 @@ edition = "2021"
 license = "GPL-2.0-or-later"
 description = "macOS host engine for DisplayLink DL3 docks: drives the vendored Vino userspace core and exposes a C ABI to the Swift display host."
 
+# The vendored crates sit outside this directory; listing them makes `-p dlcore --features oracle`
+# legal from here and lets them build standalone with this manifest's libusb1-sys patch.
+[workspace]
+members = [".", "../vendor/dlcore/dlcore", "../vendor/dlcore/dlcore-usb", "../vendor/dlcore/kernel-shim"]
+
 [lib]
 crate-type = ["staticlib", "rlib"]
 
 [dependencies]
-vino-chimera = { path = "../vendor/vino/chimera", features = ["live"] }
+dlcore = { path = "../vendor/dlcore/dlcore", features = ["live"] }
 # Build libusb from source and link it statically, so the app does not depend on Homebrew.
 libusb1-sys = { version = "0.7", features = ["vendored"] }
 

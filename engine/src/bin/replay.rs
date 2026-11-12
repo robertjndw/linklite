@@ -12,7 +12,7 @@ use dllite_engine::host::Rect;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-use vino_chimera::kvino::Family;
+use dlcore::kvino::Family;
 
 type Lut = [[u8; 256]; 3];
 

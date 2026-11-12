@@ -211,7 +211,7 @@ public struct DockIdentity: Equatable {
         a.firmware == b.firmware && a.platform == b.platform
     }
 
-    /// Mirrors `Family::from_identity` and `profile::for_family` in vendor/vino, which stay the
+    /// Mirrors `Family::from_identity` and `profile::for_family` in vendor/dlcore, which stay the
     /// source of truth; dlprobe deliberately does not link the engine, so the names are restated.
     public var family: (name: String, supported: Bool)? {
         switch platform {
@@ -241,7 +241,7 @@ public func parseDockIdentity(_ bytes: [UInt8]) -> DockIdentity? {
         guard length >= 2, offset + length <= bytes.count else { return nil }
         if bytes[offset + 1] == 0x40, length >= 16 {
             let d = Array(bytes[offset..<(offset + 16)])
-            // The name is padded with NULs or spaces, matching `Identity::platform` in vino-driver.
+            // The name is padded with NULs or spaces, matching `Identity::platform` in dlcore-usb.
             let name = d[8..<16].prefix { $0 != 0 && $0 != 0x20 }
             let platform = String(decoding: name, as: UTF8.self)
             return DockIdentity(firmware: (Int(d[2]), Int(d[3]), Int(d[4])), platform: platform)

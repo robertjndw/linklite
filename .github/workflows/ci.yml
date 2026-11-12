@@ -1,6 +1,6 @@
 # LinkLite: Continuous Integration
 #
-# Builds and tests the Rust engine, the vendored Vino core, and the Swift package on a hosted
+# Builds and tests the Rust engine, the dlcore protocol core, and the Swift package on a hosted
 # Apple Silicon runner. No dock is attached, so this covers the headless tests and that the app
 # builds and links; it does not prove behaviour on hardware. No secrets are used, so the workflow
 # runs the same on forked pull requests.
@@ -64,13 +64,13 @@ jobs:
       - name: Test engine
         run: cargo test --locked --manifest-path engine/Cargo.toml
 
-      - name: Test vendored Vino core
+      - name: Test dlcore protocol core
         working-directory: engine
-        run: cargo test --locked -p vino-chimera
+        run: cargo test --locked -p dlcore
 
       - name: Test USB transport ownership
         working-directory: engine
-        run: cargo test --locked -p vino-driver
+        run: cargo test --locked -p dlcore-usb
 
       - name: Build engine (release)
         run: cargo build --locked --release --manifest-path engine/Cargo.toml

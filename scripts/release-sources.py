@@ -60,8 +60,8 @@ def notices(resources):
     copy_required(ROOT / ".build/artifacts/sparkle/Sparkle/LICENSE",
                   resources / "Sparkle-LICENSE.txt")
     for name in ("GPL-2.0", "LGPL-2.1"):
-        copy_required(ROOT / "vendor/vino/LICENSES" / name, licenses / "Vino" / name)
-    copy_required(ROOT / "vendor/vino/UPSTREAM.md", licenses / "Vino/UPSTREAM.md")
+        copy_required(ROOT / "vendor/dlcore/LICENSES" / name, licenses / "Vino" / name)
+    copy_required(ROOT / "vendor/dlcore/ORIGIN.md", licenses / "Vino/ORIGIN.md")
     copy_required(ROOT / "vendor/libusb1-sys/LICENSE", licenses / "libusb1-sys-0.7.0/LICENSE")
     copy_required(ROOT / "vendor/libusb1-sys/libusb/COPYING", licenses / "libusb/COPYING")
     copy_required(ROOT / "vendor/libusb1-sys/libusb/AUTHORS", licenses / "libusb/AUTHORS")
@@ -82,9 +82,9 @@ def notices(resources):
     ]
     local = {
         "dllite-engine": ROOT / "engine/Cargo.toml",
-        "kernel-shim": ROOT / "vendor/vino/kernel-shim/Cargo.toml",
-        "vino-chimera": ROOT / "vendor/vino/chimera/Cargo.toml",
-        "vino-driver": ROOT / "vendor/vino/vino-driver/Cargo.toml",
+        "kernel-shim": ROOT / "vendor/dlcore/kernel-shim/Cargo.toml",
+        "dlcore": ROOT / "vendor/dlcore/dlcore/Cargo.toml",
+        "dlcore-usb": ROOT / "vendor/dlcore/dlcore-usb/Cargo.toml",
         "libusb1-sys": ROOT / "vendor/libusb1-sys/Cargo.toml",
     }
     for package in sorted(metadata(ROOT)["packages"], key=lambda p: (p["name"], p["version"])):

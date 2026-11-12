@@ -5,7 +5,7 @@
 //! Needs exclusive use of the dock: DisplayLink Manager must not be running.
 
 use dllite_engine::edid;
-use vino_chimera::session::ControlSession;
+use dlcore::session::ControlSession;
 
 fn main() {
     let mut session = match ControlSession::engage() {

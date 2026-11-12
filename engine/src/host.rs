@@ -11,11 +11,11 @@ use crate::edid::{self, Monitor};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
-use vino_chimera::kvino::{self, DockProfile, Family, StripEncoding};
-use vino_chimera::session::{ControlSession, PresentEncodedError, PresentTiming};
-use vino_chimera::pool::STREAMING_THREADS;
-use vino_chimera::scanout::StripHasher;
-use vino_chimera::MAX_CONNECTORS;
+use dlcore::kvino::{self, DockProfile, Family, StripEncoding};
+use dlcore::session::{ControlSession, PresentEncodedError, PresentTiming};
+use dlcore::pool::STREAMING_THREADS;
+use dlcore::scanout::StripHasher;
+use dlcore::MAX_CONNECTORS;
 
 const HEARTBEAT_PERIOD: Duration = Duration::from_secs(3);
 const PRESENCE_PERIOD: Duration = Duration::from_secs(1);
@@ -524,7 +524,7 @@ impl Shared {
         };
         // A few bands (a cursor blink, a typed character) are cheaper than waking a worker.
         let threads = if bands.len() < 4 { 1 } else { STREAMING_THREADS };
-        vino_chimera::pool::for_each_mut(&mut bands, threads, |_, band| work(band));
+        dlcore::pool::for_each_mut(&mut bands, threads, |_, band| work(band));
         let newly: usize = bands.iter().map(|band| band.4).sum();
         drop(bands);
         mailbox.changed_count += newly;
@@ -851,7 +851,7 @@ fn apply_gamma(dst: &mut [u8], src: &[u8], lut: &[[u8; 256]; 3]) {
         return;
     }
     let mut chunks: Vec<(&mut [u8], &[u8])> = dst.chunks_mut(CHUNK_BYTES).zip(src.chunks(CHUNK_BYTES)).collect();
-    vino_chimera::pool::for_each_mut(&mut chunks, STREAMING_THREADS, |_, (d, s)| serial(d, s));
+    dlcore::pool::for_each_mut(&mut chunks, STREAMING_THREADS, |_, (d, s)| serial(d, s));
 }
 
 /// Convert BGRA pixels to packed RGB888, `min(rgb.len() / 3, bgra.len() / 4)` of them.
@@ -1153,7 +1153,7 @@ fn run_session(
                 continue;
             }
             // Once the surface has been still for a moment, send everything that moved since the
-            // last settle to every dock buffer again (local patch in vendor/vino/UPSTREAM.md).
+            // last settle to every dock buffer again (local patch in vendor/dlcore/ORIGIN.md).
             if !output.settled && now.duration_since(output.last_change) >= SETTLE_DELAY {
                 session.settle(head as u8);
                 output.settled = true;
@@ -1949,7 +1949,7 @@ mod tests {
 
     #[test]
     fn padding_rounds_up_to_whole_ridge_strips() {
-        let ridge = vino_chimera::kvino::DockProfile::for_family(vino_chimera::kvino::Family::Ridge)
+        let ridge = dlcore::kvino::DockProfile::for_family(dlcore::kvino::Family::Ridge)
             .expect("Ridge profile");
         // Ridge strips are 64x16: 4K needs no padding, an odd size rounds up on both axes.
         assert_eq!(padded(ridge, 3840, 2160), (3840, 2160));

@@ -4,7 +4,7 @@
 
 use crate::edid::Monitor;
 use crate::host::{self, CursorShape, Events, HeadStats, Mode, Shared, State};
-use vino_chimera::kvino::{self, CodeTable, DockProfile, Family, QuantBlock};
+use dlcore::kvino::{self, CodeTable, DockProfile, Family, QuantBlock};
 use std::ffi::{c_char, c_void, CString};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::Arc;
@@ -218,7 +218,7 @@ pub unsafe extern "C" fn dll_engine_move_cursor(engine: *mut DLLEngine, head: i3
 
 /// Heads a `dll_engine_stats` call can report; `DLL_MAX_HEADS` in dllite.h.
 const MAX_HEADS: usize = 4;
-const _: () = assert!(MAX_HEADS == vino_chimera::MAX_CONNECTORS);
+const _: () = assert!(MAX_HEADS == dlcore::MAX_CONNECTORS);
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

@@ -24,7 +24,7 @@ Status 2026-11-03: **PASS** at 5000 Mbps on the current desk. An earlier setup r
 
 Independently confirm that product `0x600f` uses the same DL3 control and video endpoint layout documented for the DL-6000 family. This gate is read-only: descriptors and known-safe device queries only.
 
-Licensing: the Vino sources carry per-file `SPDX-License-Identifier: GPL-2.0` / `GPL-2.0-or-later` headers (and `revdi/LICENSES/`), so they are vendored under those terms in `vendor/vino/` and this project is GPL-2.0-or-later.
+Licensing: the Vino sources carry per-file `SPDX-License-Identifier: GPL-2.0` / `GPL-2.0-or-later` headers (and `revdi/LICENSES/`), so they are vendored under those terms in `vendor/dlcore/` and this project is GPL-2.0-or-later.
 
 Status 2026-11-03: **layout matches DL-6xxx "Ridge"** (`swift run dlprobe --descriptors`, `bcdDevice 0x3104`):
 
@@ -51,7 +51,7 @@ Success means:
 
 No video endpoint writes are allowed at this gate.
 
-Status 2026-11-03: **PASS** on the live dock. HDCP 2.2 AKE and the sealed control session complete on macOS over libusb; both monitors read as `HPN HP Z27k G3`, 3840x2160@60 (once the monitors were powered on, and after the local EDID readiness patch in `vendor/vino/UPSTREAM.md`); quitting the app releases the dock.
+Status 2026-11-03: **PASS** on the live dock. HDCP 2.2 AKE and the sealed control session complete on macOS over libusb; both monitors read as `HPN HP Z27k G3`, 3840x2160@60 (once the monitors were powered on, and after the local EDID readiness patch in `vendor/dlcore/ORIGIN.md`); quitting the app releases the dock.
 
 ### Gate 3: one-head video proof
 
@@ -163,5 +163,5 @@ Public release evidence (latest v0.3.15, plus historical v0.3.7 updater evidence
 - [Humanscale M/Connect 2 user guide](https://humanscale.getbynder.com/m/49d81af0b0b26c05/original/hs-technology-tool-m-connect2-user-guide.pdf)
 - [Synaptics DL-6000 series](https://drivers.synaptics.com/products/displaylink-graphics/integrated-chipsets/dl-6000)
 - [FireBurn/Vino clean-room research](https://lwn.net/Articles/1090989/) (drm/vino v3 cover letter; drives DL-6xxx on Linux)
-- [Vino protocol notes](https://github.com/cameron1729/Vino/tree/main/docs) (the `revdi/` sources LinkLite builds on are vendored in `vendor/vino/` under their per-file GPL-2.0 / GPL-2.0-or-later SPDX headers; see `vendor/vino/UPSTREAM.md`)
+- [Vino protocol notes](https://github.com/cameron1729/Vino/tree/main/docs) (the `revdi/` sources LinkLite builds on are vendored in `vendor/dlcore/` under their per-file GPL-2.0 / GPL-2.0-or-later SPDX headers; see `vendor/dlcore/ORIGIN.md`)
 - [DisplayLink Manager 16.2 release notes](https://drivers.synaptics.com/sites/default/files/release_notes/2026-07/DisplayLink%20Manager%20Graphics%20Connectivity16.2-Release%20Notes.txt)

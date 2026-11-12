@@ -20,8 +20,8 @@
 //! outside the engine ([`Replay::step_encoded`], the GPU encoder's path).
 
 use super::*;
-use vino_chimera::kvino;
-use vino_chimera::scanout::{CachedEncodeError, HeadScanout};
+use dlcore::kvino;
+use dlcore::scanout::{CachedEncodeError, HeadScanout};
 
 const TRANSFER_SIZE: usize = 65_536;
 
@@ -256,7 +256,7 @@ impl Replay {
         self.send(frame, &plan, encoded_at, step);
     }
 
-    fn send(&mut self, frame: vino_chimera::scanout::Frame, plan: &vino_chimera::scanout::Plan, encoded_at: Instant, step: &mut Step) {
+    fn send(&mut self, frame: dlcore::scanout::Frame, plan: &dlcore::scanout::Plan, encoded_at: Instant, step: &mut Step) {
         for repeat in 0..frame.presentations {
             let transfers = pack(self.dock, &frame.records, self.seq.wrapping_add(repeat));
             step.sent_bytes += transfers.iter().map(Vec::len).sum::<usize>();

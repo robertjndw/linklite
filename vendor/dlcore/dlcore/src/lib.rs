@@ -1,0 +1,97 @@
+//! # dlcore
+//!
+//! The beginning of an open replacement for the closed `DisplayLinkManager`
+//! binary: a rig that runs the **actual in-kernel vino driver code** but drives
+//! the dock from userspace over libusb. See `README.md` for the full picture.
+//!
+//! Two heads, one body:
+//!
+//! * **body** — [`kvino`] `include!`s the literal kernel `cp.rs`/`proto.rs` (and
+//!   `video.rs`/`ake.rs`/`hdcp.rs`) behind the [`kshim`] kernel-prelude, so the
+//!   AES-CTR seal, Dl3Cmac and every CP builder are the same bytes `vino.ko` runs.
+//!   Those sources are vendored under `vino/`, synced from a kernel tree by
+//!   `scripts/sync-kernel-sources.sh` — never hand-edited.
+//! * **offline head** ([`prove`], the `chimera-prove` binary) — feeds captured DLM
+//!   sessions back through that code and asserts byte-exact equivalence: for every
+//!   OUT CP frame DLM put on the wire, the kernel `seal` reproduces it exactly, and
+//!   every CP builder reproduces DLM's inner plaintext exactly.
+//! * **live session** (`--features live`) - authenticates the dock over libusb and
+//!   presents frames; the host engine drives it, and `chimera-coldstart` exercises it.
+
+pub mod ddcci;
+#[cfg(feature = "live")]
+pub mod edid_fetch;
+pub mod kshim;
+pub mod kvino;
+/// Persistent worker pool for the engine's parallel passes (local displaylink-lite patch).
+pub mod pool;
+pub mod prove;
+pub mod scanout;
+pub mod trace;
+#[cfg(feature = "live")]
+pub mod session;
+
+/// What the vendored kernel sources reach for in the driver crate's root.
+///
+/// The largest connector count any dock profile describes, from the driver's own header.
+///
+/// Array sizes use it; loops use the dock's own connector count. It is re-exported rather than
+/// restated so there is one definition of the bound in this crate, and asserted against the
+/// transport's, which sizes its endpoint table the same way.
+pub use crate::kvino::drm_sink::MAX_CONNECTORS;
+
+/// The driver names two of its own modules from its crate root, and the vendored sources resolve
+/// those paths against this one. Re-exported rather than restated, so there is one definition.
+pub use crate::kvino::{drm_sink, firmware};
+
+#[cfg(feature = "live")]
+const _: () = assert!(
+    MAX_CONNECTORS == dlcore_usb::MAX_HEADS,
+    "dlcore and dlcore-usb must agree on the connector bound"
+);
+
+/// Whether verbose protocol diagnostics were asked for, the rig's equivalent of the driver's
+/// `debug=1` module parameter.
+pub fn debug_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("CHIMERA_DEBUG").is_some_and(|v| v != "0"))
+}
+
+#[cfg(test)]
+mod kshim_crypto_kat {
+    //! Known-answer tests for the crypto primitives added to `kshim::crypto` to
+    //! support `hdcp.rs` (SHA-256 and HMAC-SHA256) -- the genuinely
+    //! new userspace-specific risk, since `hdcp.rs` itself is the literal,
+    //! already-HW-proven kernel file. AES-CTR/CMAC are exercised by
+    //! `chimera-prove`'s 192/192 byte-exact proof already.
+    use crate::kshim::crypto;
+
+    #[test]
+    fn sha256_abc() {
+        // NIST/FIPS 180-4 short KAT.
+        let h = crypto::sha256(b"abc");
+        assert_eq!(
+            h,
+            [
+                0xba, 0x78, 0x16, 0xbf, 0x8f, 0x01, 0xcf, 0xea, 0x41, 0x41, 0x40, 0xde, 0x5d, 0xae,
+                0x22, 0x23, 0xb0, 0x03, 0x61, 0xa3, 0x96, 0x17, 0x7a, 0x9c, 0xb4, 0x10, 0xff, 0x61,
+                0xf2, 0x00, 0x15, 0xad,
+            ]
+        );
+    }
+
+    #[test]
+    fn hmac_sha256_rfc4231_case1() {
+        // RFC 4231 sec 4.2: key=0x0b*20, data="Hi There".
+        let key = [0x0bu8; 20];
+        let h = crypto::hmac_sha256(&key, b"Hi There");
+        assert_eq!(
+            h,
+            [
+                0xb0, 0x34, 0x4c, 0x61, 0xd8, 0xdb, 0x38, 0x53, 0x5c, 0xa8, 0xaf, 0xce, 0xaf, 0x0b,
+                0xf1, 0x2b, 0x88, 0x1d, 0xc2, 0x00, 0xc9, 0x83, 0x3d, 0xa7, 0x26, 0xe9, 0x37, 0x6c,
+                0x2e, 0x32, 0xcf, 0xf7,
+            ]
+        );
+    }
+}

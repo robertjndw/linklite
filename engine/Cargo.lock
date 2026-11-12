@@ -85,11 +85,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "dlcore"
+version = "0.0.1"
+dependencies = [
+ "aes",
+ "cipher",
+ "dlcore",
+ "dlcore-usb",
+ "getrandom",
+ "hmac",
+ "kernel-shim",
+ "sha2",
+]
+
+[[package]]
+name = "dlcore-usb"
+version = "0.0.1"
+dependencies = [
+ "libc",
+ "rusb",
+]
+
+[[package]]
 name = "dllite-engine"
 version = "0.1.0"
 dependencies = [
+ "dlcore",
  "libusb1-sys",
- "vino-chimera",
 ]
 
 [[package]]
@@ -246,27 +268,6 @@ name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
-
-[[package]]
-name = "vino-chimera"
-version = "0.0.1"
-dependencies = [
- "aes",
- "cipher",
- "getrandom",
- "hmac",
- "kernel-shim",
- "sha2",
- "vino-driver",
-]
-
-[[package]]
-name = "vino-driver"
-version = "0.0.1"
-dependencies = [
- "libc",
- "rusb",
-]
 
 [[package]]
 name = "wasi"
